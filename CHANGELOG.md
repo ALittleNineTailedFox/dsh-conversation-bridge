@@ -93,3 +93,6 @@
   深度上限仍是兜底。B 觉得 A 问得不清楚而反问 A，走的就是同一个工具。
 - **`conversation_start` 开场消息带上交接人 sessionId 与其标题/工作目录**，
   并写清"要问它/回给它用 `conversation_send`、取答复先看 `answered` 再看 `trust`"。
+- **投递围栏可见化**：目标是子 agent 会话时提前拒（不浪费一次投递）；目标正被活着的子 agent
+  持有时，把宿主的 `owned by subagent routing` 翻译成"等它跑完再来投，或改用只读翻书看它的最新输出"，
+  不再把宿主的原始拒绝信息砸给调用方。
