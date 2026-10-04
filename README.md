@@ -82,7 +82,7 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 老对话 A：占用到 70% → 插件提醒 → 写交接件 → conversation_start 开新对话 B
 新对话 B：
   ① conversation_send(A, "上次那个报错的根因是什么")
-     → conversation_read(A, askId=上面的 messageId) → answered=true 且 trust=clean 就直接用
+     → conversation_read(A, messageId=上面的 messageId) → answered=true 且 trust=clean 就直接用
   ② 若 answered=false（它还在跑/还没答）就稍后再读；若 trust=compacted_by_ask（这一问把 A 推过线了）：
      conversation_outline(A) → conversation_search(A, "EADDRINUSE")
      → conversation_read(A, atSeq=命中位置)  取原文

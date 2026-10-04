@@ -10,7 +10,7 @@
 - **跨对话发消息（唯一管道）**：`conversation_send` 向指定对话塞一条消息，两个方向都走它——
   提问、回信、反问、只通知。默认 `mode: 'steer'`：**插进对方当前回合的下一步**（对方正在跑也能看到），
   不是等它整轮输出完再追加；返回 `messageId` 与事前读数（对方占用、预计压缩风险），
-  `conversation_read` 用 `askId=messageId` 读答复。
+  `conversation_read` 用 `messageId=messageId` 读答复。
   合并前的 `conversation_ask` / `conversation_reply` 已删除（两者在宿主侧是同一个 `prompt`，
   差别只在信封与护栏；管道只有一条，不该有两个工具名）。
 - **发信人身份随消息走**：宿主消息模型没有发信人概念（`source` 只有 `kind` / `rpcId`），

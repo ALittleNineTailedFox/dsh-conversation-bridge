@@ -152,7 +152,7 @@ A 上下文 ≥ 阈值
 
 B 工作中需要 A 的旧信息
    ├─ 路一 首选：conversation_send(A, 问题)          ← 窄指令，A 回一轮
-   │     └─ conversation_read(A, askId=本次)
+   │     └─ conversation_read(A, messageId=本次)
    │           ├─ trust=clean            → 直接用
    │           ├─ trust=compacted_by_ask → 结果可能失真 → 走路二比对
    │           └─ 答不上来/超时          → 走路二
@@ -428,7 +428,7 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
   · **交接人（上一段对话）的 sessionId** + 它的标题/工作目录（标题查本对话自己的，不拿新对话的 title 顶上）
   · 本次交接件文件路径 + 交接件目录的用法
   · 管道用法：「要问它/回给它用 `conversation_send`（sessionId 指对方；答复类传 reply=true）」
-  · 取答复用法：「`conversation_read`（askId=上一步的 messageId），**先看 answered 再看 trust**」
+  · 取答复用法：「`conversation_read`（messageId=上一步的 messageId），**先看 answered 再看 trust**」
   · 回退用法：「`conversation_outline` → `conversation_search` → `conversation_read`（atSeq）」翻原文
   · 若模型自己想把结论再存一份到别处，那是它的事；**本插件不提示、不指路、不参与**
 返回：{ sessionId, cwd, workspaceId, grouped, title, parentSessionId, messageSent, note }
@@ -459,7 +459,7 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
   occupancyBefore: { tokens, contextWindow, percent, source }
   projectedAfterPercent            // 加上这一条之后的预计占用
   compactionRisk: 'low'|'likely'   // 预计越线 → 'likely'
-  messageId: string                // = 本次 prompt 的 requestId，之后用 read 的 `askId` 参数精确定位答复窗口
+  messageId: string                // = 本次 prompt 的 requestId，之后用 read 的 `messageId` 参数精确定位答复窗口
   depth: number                    // 本条投递之后的依赖跳数
   narrow: boolean                  // 本条是否包了窄指令（提问包、答复不包）
 返回：{ sessionId, messageId, accepted, mode, woken, depth, narrow, compactionRisk, occupancyBefore, projectedAfterPercent, hint }
@@ -483,7 +483,7 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 ```
 参数：{
   sessionId: string,
-  askId?: string,                // 给了 → 用 rpcId 精确定位这一次发消息的答复窗口（推荐；值取 send 的 messageId）
+  messageId?: string,                // 给了 → 用 rpcId 精确定位这一次发消息的答复窗口（推荐；值取 send 的 messageId）
   atSeq?: number,                // 给了 → 取该 seq 的原文块（Tier-2）
   limit?: integer,               // 默认 30
   includeTools?: boolean,        // 默认 true（v1 只取 text，丢工具结果是缺陷）
@@ -494,7 +494,7 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
   sessionId, messages: [{ seq, role, text, kind }],
   // kind: 'user' | 'assistant' | 'tool' | 'compaction-summary'
   answered: boolean,             // **对方答完了没**：只有"提问之后、不含工具调用、文本非空"的助手帧才算答复
-  reason: string,                // 'ok' | 'no-ask-id' | 'ask-not-found' | 'no-reply-yet'
+  reason: string,                // 'ok' | 'no-message-id' | 'message-not-found' | 'no-reply-yet'
                                  // | 'reply-pending-tool-call'（最近的助手帧只有工具调用，它还在干活）
                                  // | 'empty-session' | 'concurrent-input' | 'compaction-before-reply' | 'earlier-compaction'
   trust: 'clean' | 'compacted_by_ask' | 'compacted_earlier' | 'unknown',
@@ -511,7 +511,7 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 - **答复锚点只认提问之后的助手帧**（`event.seq > questionSeq`），且跳过含 `tool-call` 的帧。
   翻页窗口里带着提问之前的旧答复是常态（同一目标被问过不止一次），
   把旧答复当成这一次的答复等于答非所问；把 `[工具调用 pwsh]` 当成答复则等于"它答了个空"。
-- `askId` 省略时**不猜**：返回 `reason:'no-ask-id'`，由调用方显式给 `askId` 或 `atSeq`。
+- `messageId` 省略时**不猜**：返回 `reason:'no-message-id'`，由调用方显式给 `messageId` 或 `atSeq`。
 - **读答复必须拿实时游标**（`fresh`，绕过游标缓存）：缓存游标会把对方刚落盘的答复挡在外面。
   真机事故：答复已落盘 11 秒，read 仍给旧快照（根因是游标缓存无 TTL 命中即用旧值）。
 - **读答复必须走 `page({throughSeq: sourceCursor})`**（§3.4），不能用 `-1`。
@@ -610,8 +610,8 @@ createUserMessage({ content, source })  →  session.append("user/message", mess
 ⇒ **我们能在日志里按 `event.data.source.rpcId` 精确找到"自己问的那一条"**，它的 seq 就是窗口起点。
 
 1. `conversation_send` 生成 `requestId`（返回给调用方当 `messageId`）；**插件不替调用方猜窗口**，
-   读的时候必须把这个 id 显式传给 `conversation_read` 的 `askId`——省略就不猜（`reason:'no-ask-id'`）。
-2. `conversation_read` 翻最近若干页，找 `event.data.source.rpcId === askId` 的 `user/message` → `questionSeq`。
+   读的时候必须把这个 id 显式传给 `conversation_read` 的 `messageId`——省略就不猜（`reason:'no-message-id'`）。
+2. `conversation_read` 翻最近若干页，找 `event.data.source.rpcId === messageId` 的 `user/message` → `questionSeq`。
 3. 窗口 = `(questionSeq, 现在]`。找窗口内**不含 `tool-call`** 的、最后一条有文本块的 `assistant/message` → `replySeq`。
    含 `tool-call` 的助手帧只记 `pendingToolCall`（说明它还在干活），不算答复。
 4. 找窗口内的 `compaction/summary`（或带 `surfaceOp.replace` 的 checkpoint）→ `compactionSeq`：
@@ -758,10 +758,10 @@ recentAsks: 环形缓冲（全局频率限制）
 - [x] **验收通过**（第 4/5/6 组）：被压缩覆盖的 `tool/result` 能被搜到（seq=4）并能取回原文块
 
 ### P2 · 回问与可信度 ✅ 已完成
-- [x] `conversation_send`（窄指令 + 事前读数 + askId + 压缩风险预警）
+- [x] `conversation_send`（窄指令 + 事前读数 + messageId + 压缩风险预警）
 - [x] `conversation_read` 的 `trust` 四态（用 `rpcId` 定位窗口，§5.3）
 - [x] `conversation_context` 改走只读通道（修掉 v1 的唤醒缺陷）
-- [x] **验收通过**（第 8 组）：clean / compacted_earlier / compacted_by_ask / unknown（无答复、并发噪声、无 askId）全部命中
+- [x] **验收通过**（第 8 组）：clean / compacted_earlier / compacted_by_ask / unknown（无答复、并发噪声、无 messageId）全部命中
 
 ### P3 · 护栏 ✅ 已完成
 - [x] `dependsOn` 图 + 深度 / 环路 / 同对冷却 / 全局频率
@@ -882,7 +882,7 @@ handoff:
 | 3 | subagent 会话的 `page` 是否可用（`address.kind='subagent'`） | 影响子树翻书 | P1 实测；退化路径：用主会话 id + seq 范围 |
 | 4 | 冷会话占用只能拿缓存投影（可能过期） | 事前读数不准 | 一律标注 `occupancySource`，不给假精度 |
 | 5 | 回问的答复是异步的，`read` 可能早于答复落库 | trust 误判 | 返回 `answered:false` 且 `trust:'unknown'`，提示稍后再读 |
-| 6 | 对方有并发输入时窗口有噪声 | 误判 `clean` | 保守：窗口内出现**非本次 askId** 的 user 消息 ⇒ 降为 `unknown` |
+| 6 | 对方有并发输入时窗口有噪声 | 误判 `clean` | 保守：窗口内出现**非本次 messageId** 的 user 消息 ⇒ 降为 `unknown` |
 | 7 | 新对话用翻书把自己撑爆 | 防丢手段反成负担 | 全部返回硬上限 + 目录优先下探 |
 | 8 | 改动需重启才生效，调试周期长 | 迭代慢 | 每阶段先本地冒烟（假宿主）再装；一次装完多改 |
 | 9 | `inspect()` 读全量事件前缀，大会话很贵 | 取精确游标代价高 | 优先用 `list().projections.asOfSeq`；`inspect` 结果**按会话缓存**，只在必要时用 |

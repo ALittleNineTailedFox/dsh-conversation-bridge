@@ -739,7 +739,7 @@ function buildTools(api, config) {
       description:
         '读一个对话的消息。三种用法：'
         + '① 只给 sessionId → 读最新一页；'
-        + '② 给 askId（来自 conversation_send 的 messageId）→ 读那一次发消息的答复，并附带可信度 trust；'
+        + '② 给 messageId（conversation_send 返回的那个）→ 读那一次发消息的答复，并附带可信度 trust；'
         + '   注意 `answered` 才是"对方答完了没"，`trust` 只表示表面可不可信——'
         + '   `answered:false` 时多半是它还在跑工具或还没开始答，稍后再读。'
         + '③ 给 atSeq → 取该位置的原文块（配合 conversation_search 的命中位置下探）。'
@@ -750,7 +750,8 @@ function buildTools(api, config) {
         required: ['sessionId'],
         properties: {
           sessionId: { type: 'string', description: '要读的对话 sessionId' },
-          askId: { type: 'string', description: 'conversation_send 返回的 messageId：读这一次发消息的答复并判定可信度' },
+          messageId: { type: 'string', description: 'conversation_send 返回的 messageId：读它这一次的答复并判定可信度' },
+          askId: { type: 'string', description: 'messageId 的旧名（同一个值），仅为兼容保留' },
           atSeq: { type: 'integer', description: '取该 seq 的原文块' },
           limit: { type: 'integer', description: `最多读多少条消息，默认 ${config.archive.pageSize}` },
           includeTools: { type: 'boolean', description: '是否包含工具结果（默认 true；压缩最容易丢的就是它）' },
@@ -779,6 +780,8 @@ function buildTools(api, config) {
         requireHost()
         const sessionId = readText(args.sessionId, '')
         if (sessionId === '') throw new Error(`${PLUGIN}: conversation_read 需要 sessionId`)
+        // messageId 是规范名；askId 是合并前的旧名，同一个值
+        const messageId = readText(args.messageId, readText(args.askId, ''))
         const maxChars = config.archive.maxBlockChars
         const includeTools = args.includeTools !== false && config.archive.includeToolResults
         const roles = includeTools ? ['user', 'assistant', 'tool'] : ['user', 'assistant']
@@ -810,7 +813,7 @@ function buildTools(api, config) {
         // ①② 读最新一页 / 读某次发消息的答复
         const hint = addressHintOf(args)
         // 读"答复"必须拿实时游标：缓存游标会把对方刚落盘的答复挡在外面（真机事故）
-        const cursor = await host.resolveCursor(sessionId, signalOf(exec), undefined, { fresh: args.askId !== undefined })
+        const cursor = await host.resolveCursor(sessionId, signalOf(exec), undefined, { fresh: messageId !== '' })
         if (cursor === undefined) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
         if (cursor < 0) {
           return { sessionId, messages: [], trust: 'unknown', answered: false, reason: 'empty-session', compactionPoints: [] }
@@ -819,27 +822,28 @@ function buildTools(api, config) {
           sessionId,
           throughSeq: cursor,
           maxMessages: readInteger(args.limit, config.archive.pageSize, 1, 200),
-          maxPages: args.askId === undefined ? 1 : config.archive.maxPages,
+          maxPages: messageId === '' ? 1 : config.archive.maxPages,
           // 要读"某次发消息的答复"时必须拿实时游标：缓存游标会把刚落盘的答复挡在外面
-          ...(args.askId === undefined ? {} : { fresh: true }),
+          ...(messageId === '' ? {} : { fresh: true }),
           ...(hint === undefined ? {} : { addressHint: hint }),
         }, signalOf(exec))
         const events = eventsOf(pages.records)
         const messages = extractMessages(events, { roles, maxChars }).slice(-readInteger(args.limit, config.archive.pageSize, 1, 200))
         const occupancyAfter = await host.readPressureById(sessionId, signalOf(exec))
 
-        if (args.askId === undefined) {
+        // 没给 messageId：只读最新一页，不判断"答复"。不能谎报"没答复"——没给我 id 就无从判断。
+        if (messageId === '') {
           return {
             sessionId,
             messages,
             trust: 'unknown',
             answered: false,
-            reason: 'no-ask-id',
+            reason: 'no-message-id',
             compactionPoints: collectCompactionPoints(events, { headChars: 120 }).map(toPointView),
             ...(occupancyAfter === undefined ? {} : { occupancyAfter }),
           }
         }
-        const verdict = assessTrust(events, String(args.askId))
+        const verdict = assessTrust(events, String(messageId))
         return {
           sessionId,
           messages,
@@ -868,7 +872,7 @@ function buildTools(api, config) {
         + '你要什么写在 text 里（提问、要结论、通知、或"不用再回我"）——**它回不回、怎么回是它自己的决定**，'
         + '插件不替你规定它必须回。每条消息都会带上"本条来自哪个对话、要回时怎么回"，对方因此知道往哪回。'
         + '对方问你不清楚时，你直接用同一个工具反问它即可。'
-        + '返回里的 messageId 就是投递锚点：之后用 conversation_read（sessionId + askId=该 id）读它给你的答复。',
+        + '返回里的 messageId 就是投递锚点：之后用 conversation_read（sessionId + messageId=该 id）读它给你的答复。',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -899,14 +903,14 @@ function buildTools(api, config) {
           type: 'text',
           text: `已把消息塞给对话 ${value.sessionId}：accepted=${value.accepted}，mode=${value.mode}`
             + `${value.woken ? '' : '（未唤醒，留在对方收件箱）'}，窄指令=${value.narrow}\n`
-            + `messageId=${value.messageId}（读它的答复要用它传 conversation_read 的 askId）\n`
+            + `messageId=${value.messageId}（读它的答复要用它传 conversation_read 的 messageId）\n`
             + `${value.mode === 'steer' ? '已插进对方当前回合的下一步（它正在跑也能看到）' : '已排到对方本轮结束之后'}`
             + `，本条已带上"来自哪个对话 + 要回时怎么回"\n`
             + `对方占用${value.occupancyBefore?.percent === undefined ? '未知（该项目标没有可读的占用投影）' : ` ${value.occupancyBefore.percent}%（来源 ${value.occupancyBefore.source}）`}`
             + `${value.projectedAfterPercent === undefined ? '' : `，加上这一条预计 ${value.projectedAfterPercent}%`}`
             + `，compactionRisk=${value.compactionRisk}\n`
             + `${value.compactionRisk === 'likely' ? '⚠️ 这一条很可能把对方推过压缩线，答复可能失真——拿到后看 trust，必要时翻旧书比对。\n' : ''}`
-            + `它给你答复后，用 conversation_read（sessionId=${value.sessionId}，askId=${value.messageId}）读；先看 answered（答完没），再看 trust（可不可信）。`,
+            + `它给你答复后，用 conversation_read（sessionId=${value.sessionId}，messageId=${value.messageId}）读；先看 answered（答完没），再看 trust（可不可信）。`,
         }],
       },
       async execute(args, exec) {
@@ -967,8 +971,8 @@ function buildTools(api, config) {
           hint: compactionRisk === 'likely'
             ? '这一条很可能触发压缩，答复可能基于摘要；拿到后请核对 trust，必要时翻旧书。'
             : (mode === 'steer'
-              ? '已插进对方下一步：它会在当前回合内就看到。答复仍是异步落盘的，稍后用 conversation_read 传 askId=messageId 读。'
-              : '已排到对方下一轮。答复是异步的，稍后用 conversation_read 传 askId=messageId 读。'),
+              ? '已插进对方下一步：它会在当前回合内就看到。答复仍是异步落盘的，稍后用 conversation_read 传 messageId=返回的 messageId 读。'
+              : '已排到对方下一轮。答复是异步的，稍后用 conversation_read 传 messageId 读。'),
         }
       },
     }),
@@ -1290,7 +1294,7 @@ function renderHandoffHeader(vars) {
 - 交接人（上一段对话）sessionId = \`${vars.parentSessionId}\`${vars.parentTitle ? `（标题：${vars.parentTitle}）` : ''}${vars.parentCwd ? `，工作目录：${vars.parentCwd}` : ''}
 ${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conversation_handoffs 传 file 再读一遍）\n` : ''}- **要问它/回给它**：用 \`conversation_send\`（sessionId=\`${vars.parentSessionId}\`）把话塞过去，默认插到它的下一步；
   它是答复（不是新提问）时传 reply=true。它回不回由它决定，你要的东西写进正文。
-- **取它的结论**：\`conversation_read\`（sessionId + askId=上一步的 messageId）读答复；**先看 answered（答完没），再看 trust**：
+- **取它的结论**：\`conversation_read\`（sessionId + messageId=上一步返回的那个 id）读答复；**先看 answered（答完没），再看 trust**：
   - \`answered:false\` → 它还没答完（可能在跑工具），稍后再读，别当成"它答了个空"；
   - \`clean\` → 直接用；
   - \`compacted_by_ask\` / \`compacted_earlier\` / \`unknown\` → 结果可能失真，去翻它的原文比对。

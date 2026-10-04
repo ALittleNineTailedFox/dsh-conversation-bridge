@@ -450,19 +450,19 @@ assert.deepEqual(inject, ['tools'])
   assert.match(harness.calls.prompt.at(-1).content[0].text, /conversation_send/, '正文必须写明回信方法')
   assert.equal(askedClean.compactionRisk, 'likely', '对方已在 80% → 事前就要预警')
   assert.equal(askedClean.occupancyBefore.source, 'cached')
-  const clean = await tools.get('conversation_read').execute({ sessionId: 'session-clean', askId: askedClean.messageId }, exec)
+  const clean = await tools.get('conversation_read').execute({ sessionId: 'session-clean', messageId: askedClean.messageId }, exec)
   assert.equal(clean.trust, 'clean')
   assert.equal(clean.answered, true)
 
   // compacted_earlier：对方早就被压缩过（不是这一问问坏的 → 低优先核对）
   const askedEarlier = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '给个结论' }, exec)
-  const earlier = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: askedEarlier.messageId }, exec)
+  const earlier = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: askedEarlier.messageId }, exec)
   assert.equal(earlier.trust, 'compacted_earlier')
 
   // 尚无答复
   harness.flags.replyOnNextPrompt = false
   const asked2 = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '还没答的那问' }, as('session-ccc'))
-  const pending = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked2.messageId }, exec)
+  const pending = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked2.messageId }, exec)
   assert.equal(pending.answered, false)
   assert.equal(pending.trust, 'unknown')
   assert.equal(pending.reason, 'no-reply-yet')
@@ -471,7 +471,7 @@ assert.deepEqual(inject, ['tools'])
   // 这一问触发压缩 → compacted_by_ask（高优先：去翻旧书比对）
   harness.flags.compactionOnNextReply = true
   const asked3 = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '会越线的问题' }, as('session-ddd'))
-  const compacted = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked3.messageId }, exec)
+  const compacted = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked3.messageId }, exec)
   assert.equal(compacted.trust, 'compacted_by_ask')
   assert.equal(compacted.reason, 'compaction-before-reply')
   assert.ok(compacted.compactionPoints.some((point) => point.seq < compacted.replySeq), '压缩点必须早于答复')
@@ -480,7 +480,7 @@ assert.deepEqual(inject, ['tools'])
   // 有并发输入（真人插话）→ unknown（宁可多翻一次书）
   harness.flags.noiseOnNextPrompt = true
   const asked4 = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '有噪声的问题' }, as('session-eee'))
-  const noisy = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked4.messageId }, exec)
+  const noisy = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked4.messageId }, exec)
   assert.equal(noisy.trust, 'unknown')
   assert.equal(noisy.reason, 'concurrent-input')
   harness.flags.noiseOnNextPrompt = false
@@ -488,14 +488,14 @@ assert.deepEqual(inject, ['tools'])
   // 但**非真人**的 user 角色消息（模型切换提示等）不得算成并发噪声
   harness.flags.nonHumanNoiseOnNextPrompt = true
   const asked5 = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '有系统注入的问题' }, as('session-fff'))
-  const injected = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked5.messageId }, exec)
+  const injected = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked5.messageId }, exec)
   assert.notEqual(injected.trust, 'unknown', '模型切换提示这类注入不得把 trust 打成 unknown')
   harness.flags.nonHumanNoiseOnNextPrompt = false
 
-  // 不给 askId → 只能给 unknown，不得假装可信
+  // 不给 messageId → 只能给 unknown，不得假装可信
   const bare = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, exec)
   assert.equal(bare.trust, 'unknown')
-  assert.equal(bare.reason, 'no-ask-id')
+  assert.equal(bare.reason, 'no-message-id')
 
   // 真机时序：对方先落一条"只有工具调用、没有文本"的助手帧，再落答案。
   // 旧判定把工具调用帧当成答复（还报 clean），调用方以为拿到答案了。
@@ -503,14 +503,14 @@ assert.deepEqual(inject, ['tools'])
   const asked6 = await tools.get('conversation_send').execute({ sessionId: 'session-clean', text: '先跑工具再答' }, as('session-ggg'))
   // 只保留了工具调用那一帧：绝不能算"已答"
   harness.flags.replyOnNextPrompt = false
-  const midStep = await tools.get('conversation_read').execute({ sessionId: 'session-clean', askId: asked6.messageId }, exec)
+  const midStep = await tools.get('conversation_read').execute({ sessionId: 'session-clean', messageId: asked6.messageId }, exec)
   assert.equal(midStep.answered, false, `只有工具调用帧时绝不能算"已答"（reason=${midStep.reason} trust=${midStep.trust} q=${midStep.questionSeq} r=${midStep.replySeq}）`)
   assert.equal(midStep.reason, 'reply-pending-tool-call', '要把"它还在跑工具"和"它还没开始答"区分开')
   // 再问一次：这次会话里已有"提问→答复"历史，验证不会把**提问之前**的旧答复当成这次的答复
   harness.flags.replyOnNextPrompt = true
   harness.flags.toolCallOnNextReply = false
   const asked7 = await tools.get('conversation_send').execute({ sessionId: 'session-clean', text: '又问一次' }, as('session-hhh'))
-  const done = await tools.get('conversation_read').execute({ sessionId: 'session-clean', askId: asked7.messageId }, exec)
+  const done = await tools.get('conversation_read').execute({ sessionId: 'session-clean', messageId: asked7.messageId }, exec)
   assert.equal(done.answered, true, `这次提问有自己的答复 → 算答完（reason=${done.reason} trust=${done.trust} q=${done.questionSeq} r=${done.replySeq} 消息数=${done.messages.length} 日志长度=${harness.logs.get('session-clean').length}）`)
   assert.ok(done.replySeq > done.questionSeq, '答复锚点必须落在提问之后')
   assert.match(done.messages.map((message) => message.text).join('\n'), /答复：结论 Z/, '要能读到真正的答复文本')
