@@ -183,7 +183,9 @@ function createHarness(options = {}) {
   const listeners = new Map()
   const pendingInjections = []
   /** 哪些服务"此刻已注册"——用来复刻冷启动时服务后到的情况。 */
-  const live = new Set(options.bare === true ? [] : ['sessionController', 'agents', 'sessionProjections', 'tokenMeter'])
+  const live = new Set(options.bare === true
+    ? []
+    : ['sessionController', 'agents', 'sessionProjections', 'tokenMeter', 'workspaceRegistry'])
   let pressureState
   const agentsService = {
     get: (id) => liveAgents.get(String(id)),
@@ -215,6 +217,16 @@ function createHarness(options = {}) {
         return { stateOf: (_session, projectionKey) => (projectionKey === 'contextPressure' ? pressureState : undefined) }
       }
       if (key === 'tokenMeter') return { measure: () => ({ totalTokens: 80000 }) }
+      if (key === 'workspaceRegistry') {
+        if (options.noWorkspaceRegistry === true) return undefined
+        return {
+          // 复刻宿主：只有已登记为 workspace 的规范路径才解析得到
+          async resolveByPath(path) {
+            return path === '<工作区>' ? { id: 'ws-project', path: '<工作区>' } : undefined
+          },
+          get: (id) => (id === 'ws-project' ? { id: 'ws-project', path: '<工作区>' } : undefined),
+        }
+      }
       return undefined
     },
   }
@@ -479,7 +491,7 @@ assert.deepEqual(inject, ['tools'])
   assert.equal(harness.calls.resolveAgent, before, '只读路径绝不能调用 resolveAgent（那会唤醒对方）')
 }
 
-/* 11. conversation_start：建对话 + 接力头 + 改标题 */
+/* 11. conversation_start：建对话 + 接力头 + 改标题 + **归入正确分组** */
 {
   const harness = createHarness()
   apply(harness.ctx, {})
@@ -489,13 +501,39 @@ assert.deepEqual(inject, ['tools'])
   assert.equal(value.sessionId, 'session-new')
   assert.equal(value.parentSessionId, 'session-aaa')
   assert.equal(value.messageSent, true)
-  assert.deepEqual(harness.calls.create.at(-1), { cwd: '<工作区>', agentPreset: 'code' })
+  // 关键：必须先按目录解析出 workspace，再传 workspaceId —— 只传 cwd 会落到"未分组"
+  assert.deepEqual(harness.calls.create.at(-1), { workspaceId: 'ws-project', agentPreset: 'code' })
+  assert.equal(value.grouped, true)
+  assert.equal(value.workspaceId, 'ws-project')
+  assert.equal(value.cwd, '<工作区>', '报告的工作目录应来自 workspace 的路径')
   const body = harness.calls.prompt.at(-1).content[0].text
   assert.match(body, /\[接力对话\]/)
   assert.match(body, /conversation_ask/)
   assert.match(body, /conversation_search/)
   assert.match(body, /交接件正文/)
   assert.doesNotMatch(body, /mnemon|memorySinks|记忆插件/, '绝不能提及任何记忆插件')
+
+  // 解析不到 workspace（目录未登记 / 没有 registry）→ 退回只给 cwd，且如实报告未分组
+  const loose = createHarness({ noWorkspaceRegistry: true })
+  apply(loose.ctx, {})
+  const looseTools = toolMap(loose.tools)
+  const fallback = await looseTools.get('conversation_start').execute({ title: '无分组' }, {
+    agent: { session: { id: 'session-aaa', header: { cwd: '<工作区>' } } },
+  })
+  assert.deepEqual(loose.calls.create.at(-1), { cwd: '<工作区>' })
+  assert.equal(fallback.grouped, false)
+  assert.match(looseTools.get('conversation_start').output.render({}, fallback)[0].text, /未分组/)
+
+  // 显式 workspaceId 优先于按目录解析（agent preset 仍继承）
+  const explicit = await tools.get('conversation_start').execute({ workspaceId: 'ws-other' }, exec)
+  assert.deepEqual(harness.calls.create.at(-1), { workspaceId: 'ws-other', agentPreset: 'code' })
+  assert.equal(explicit.grouped, true)
+  assert.equal(explicit.cwd, '<工作区>', '查不到该 workspace 路径时退回算出来的 cwd')
+
+  // 未登记为 workspace 的目录 → 不硬塞分组
+  const other = await tools.get('conversation_start').execute({ cwd: 'D:\\somewhere-else' }, exec)
+  assert.deepEqual(harness.calls.create.at(-1), { cwd: 'D:\\somewhere-else', agentPreset: 'code' })
+  assert.equal(other.grouped, false)
 }
 
 /* 12. 降级与"服务后到"：

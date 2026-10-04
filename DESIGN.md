@@ -305,6 +305,21 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 - **排查插件是否真的加载了**：宿主日志在 `<宿主日志根>\logs\host\dsh-<日期>.log`
   （错误另见 `dsh-<日期>.error.log`），插件自己的 `ctx.logger.*` 行带 `[<插件名>]` 前缀，可直接搜。
   比 `list_plugins` 的 `fiberPhase` 更能说明"到底跑没跑、跑成什么样"。
+- **★ 会话的分组归属只由 `workspaceId` 决定**（2026-10-04 真机，用户指出侧栏里新对话落在"未分组"）：
+  `sessionController.create({ cwd })` 能得到正确的工作目录，但**不会把会话挂到任何 workspace**，
+  于是在侧栏显示为"未分组"；而 `create` 明确要求 **`workspaceId` 与 `cwd` 互斥**（同时给会报
+  `gateway/bad-request`）。正确做法：
+  ```js
+  const workspace = await ctx.get('workspaceRegistry')?.resolveByPath(session.header.cwd)
+  const request = workspace ? { workspaceId: workspace.id } : { cwd }
+  ```
+  `resolveByPath` 只按**规范路径**查已登记的 workspace（未登记的目录返回 `undefined`，目录不存在则 reject），
+  失败时退回 `cwd`（会话仍能建，只是不归组）。`Workspace` 形状：
+  `{ id, path, title, createdAt, updatedAt, sessionIds, setTitle, attachSession, insertSessionBefore, detachSession, status }`。
+- **插件作用域陷阱**：`buildTools(api, config)` 是模块级函数，**里面没有 `ctx`**。
+  在工具实现里写 `ctx.get(...)` 会抛 `ReferenceError`；若外面还包着 `try/catch` 做降级，
+  就会**静默退化**成兜底行为（本次就是：分组解析失败退成"未分组"，冒烟测试才抓出来）。
+  要用的宿主能力一律挂到传进去的 `api` 上（getter 形式，保持惰性）。
 - 插件清单：`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml` 插入一行；`apply(ctx, config)` 导出 `name` / `inject`。
 - 安装：`plugin_manager install_bundle`，target 传**包名**（传绝对路径二次安装会报 `ambiguous-install`）。
 - 已装包重装返回 `application: "restart-required"` ⇒ **代码与配置改动都要重启才生效**。

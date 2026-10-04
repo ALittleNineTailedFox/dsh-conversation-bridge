@@ -810,6 +810,7 @@ function buildTools(api, config) {
       description:
         '开启一个全新的 DSH 对话并可选地把第一条消息发进去（交接时把交接件全文放进来）。'
         + '新对话会出现在对话列表里并独立运行；开场消息自动带上"上一段对话是谁、怎么回问、怎么翻旧书"。'
+        + '默认归入**当前对话所在的分组**（workspace）；只给 cwd 会落到"未分组"，所以优先按工作目录解析 workspace。'
         + '阈值提醒只负责提醒，开窗由你或用户决定。',
       parameters: {
         type: 'object',
@@ -818,7 +819,8 @@ function buildTools(api, config) {
           message: { type: 'string', description: '新对话的第一条消息（交接时放交接件全文）' },
           handoffFile: { type: 'string', description: '本次交接件的文件路径（由 conversation_handoff_write 返回）' },
           title: { type: 'string', description: '给新对话起的标题' },
-          cwd: { type: 'string', description: '新对话的工作目录，默认继承当前对话' },
+          cwd: { type: 'string', description: '新对话的工作目录，默认继承当前对话；同时用它决定归入哪个分组' },
+          workspaceId: { type: 'string', description: '显式指定归入哪个分组（workspace）。给了它就不要再用 cwd 决定分组' },
           agentPreset: { type: 'string', description: '新对话使用的 agent preset，默认继承当前对话' },
         },
       },
@@ -826,6 +828,8 @@ function buildTools(api, config) {
         schema: looseSchema({
           sessionId: STRING,
           cwd: STRING,
+          workspaceId: STRING,
+          grouped: BOOLEAN,
           title: STRING,
           parentSessionId: STRING,
           messageSent: BOOLEAN,
@@ -833,7 +837,8 @@ function buildTools(api, config) {
         }),
         render: (_args, value) => [{
           type: 'text',
-          text: `已开启新对话 sessionId=${value.sessionId}${value.cwd ? `（cwd=${value.cwd}）` : ''}。`
+          text: `已开启新对话 sessionId=${value.sessionId}${value.cwd ? `（cwd=${value.cwd}）` : ''}`
+            + `${value.grouped ? `，已归入分组 workspaceId=${value.workspaceId}` : '（**未归入任何分组，会显示在"未分组"里**）'}。`
             + `${value.messageSent ? '开场消息已发送。' : '尚未发送任何消息。'}`
             + `${value.parentSessionId ? ` 它可以用 conversation_ask(sessionId=${value.parentSessionId}) 回问本对话。` : ''}`,
         }],
@@ -850,8 +855,24 @@ function buildTools(api, config) {
         const requestedPreset = readText(args.agentPreset, '')
         const agentPreset = requestedPreset !== '' ? requestedPreset : parentPreset
 
+        // 分组归属只由 workspaceId 决定，且 create 里 workspaceId 与 cwd 互斥：
+        // 只传 cwd 会得到正确的工作目录，却落到"未分组"。所以先按目录解析 workspace。
+        const requestedWorkspace = readText(args.workspaceId, '')
+        let workspaceId = requestedWorkspace
+        if (workspaceId === '' && cwd !== '') {
+          try {
+            const registry = api.workspaceRegistry
+            const workspace = await registry?.resolveByPath?.(cwd)
+            if (workspace?.id !== undefined) workspaceId = String(workspace.id)
+          } catch (error) {
+            // 目录不存在 / 未登记为 workspace → 退回只给 cwd（会显示未分组，但不阻断开窗）
+            api.warn(`按 ${cwd} 解析分组失败，将不归入分组: ${String(error)}`)
+          }
+        }
+
         const request = {}
-        if (cwd !== '') request.cwd = cwd
+        if (workspaceId !== '') request.workspaceId = workspaceId
+        else if (cwd !== '') request.cwd = cwd
         if (agentPreset !== '') request.agentPreset = agentPreset
         const created = await api.sessionController.create(request)
         const sessionId = String(created.sessionId)
@@ -883,9 +904,22 @@ function buildTools(api, config) {
           messageSent = true
         }
 
+        // 报告真实生效的工作目录：走 workspaceId 建会话时，cwd 是那个 workspace 的路径。
+        let effectiveCwd = cwd
+        if (workspaceId !== '') {
+          try {
+            const path = api.workspaceRegistry?.get?.(workspaceId)?.path
+            if (typeof path === 'string' && path.length > 0) effectiveCwd = path
+          } catch {
+            /* 取不到就报我们算出来的 cwd */
+          }
+        }
+
         return {
           sessionId,
-          cwd,
+          cwd: effectiveCwd,
+          workspaceId,
+          grouped: workspaceId !== '',
           title,
           parentSessionId,
           messageSent,
@@ -1118,6 +1152,10 @@ export function apply(ctx, input = {}) {
     config,
     get sessionController() {
       return ctx.get('sessionController')
+    },
+    /** 分组归属要看它：create 只认 workspaceId（见 conversation_start）。 */
+    get workspaceRegistry() {
+      return ctx.get('workspaceRegistry')
     },
     warn(message) {
       try {
