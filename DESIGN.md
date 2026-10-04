@@ -476,6 +476,12 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 - **护栏分工**：新提问（`reply` 不为 true）走同对冷却 + 环路 + 深度；
   回信/通知（`reply=true`）只走深度。环路护栏防的是"提问引发提问"的接力，
   拦"把结论答回去"是拦错了对象。
+- **投递围栏（宿主硬规则，插件绕不过）**：会话本身是子 agent（`origin==='subagent'`），
+  或它**正被一个活着的子 agent 持有**（宿主 `hasApiSessionSubagentOwner`），宿主都拒绝 `prompt` 投递。
+  插件在投递前用会话摘要先判第一种（不浪费一次投递），第二种只能靠投递失败时把宿主的
+  `session/agent-busy`（"owned by subagent routing"）**翻译成人话 + 给退路**：
+  等它那个子 agent 跑完再来投，或改用只读翻书看它的最新输出。
+  真机实测撞到过：新对话在回答问题时正跑着自己的子 agent，它想回信给上一段对话，回不出去。
 - 若 `compactionRisk='likely'` ⇒ **不拒绝**，但返回里明确劝阻 + 给出翻书入口建议（软门，按用户裁定）。
 
 #### 4.2.5 `conversation_read`

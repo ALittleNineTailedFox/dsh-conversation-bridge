@@ -372,6 +372,33 @@ function buildTools(api, config) {
     return id === undefined ? '' : String(id)
   }
 
+  /**
+   * 投递被宿主的"子 agent 路由持有"围栏拒绝时的统一说法。
+   *
+   * 宿主规则（`hasApiSessionSubagentOwner`）：会话本身是子 agent，或它正被一个活着的子 agent 持有，
+   * 都不接受 `prompt` 投递。插件绕不过这条，但可以把话说清楚 + 给出可行退路，
+   * 而不是把宿主的 `session/agent-busy` 原样砸给调用方。
+   */
+  function subagentHeldError(sessionId) {
+    return new Error(
+      `${PLUGIN}: 投递被拒——对话 ${sessionId} 由子 agent 路由持有（它本身就是子 agent 会话，或它正有一个子 agent 在跑）。`
+      + '宿主不允许向这种会话投递消息。'
+      + '可用的退路：① 等它那个子 agent 跑完再来投；② 用 conversation_read / conversation_outline / conversation_search 只读翻它的最新输出。',
+    )
+  }
+
+  /** 目标是不是子 agent 会话（投递必被拒）→ 提前报清楚，不浪费一次投递。 */
+  async function assertDeliverable(sessionId, exec) {
+    const held = await host.subagentHeld(sessionId, signalOf(exec))
+    if (held === 'self-subagent') throw subagentHeldError(sessionId)
+  }
+
+  /** 把宿主那条 "owned by subagent routing" 翻译成可操作的提示。 */
+  function asDeliveryError(error, sessionId) {
+    const message = error instanceof Error ? error.message : String(error)
+    return /owned by subagent routing/i.test(message) ? subagentHeldError(sessionId) : error
+  }
+
   /** 把"读一页/翻多页"统一成事件数组，并守住扫描预算。 */
   async function scanSession(sessionId, exec, options = {}) {
     const cursor = await host.resolveCursor(sessionId, signalOf(exec), options.cursorHint)
@@ -930,6 +957,8 @@ function buildTools(api, config) {
         const requestedMode = args.mode === 'queue' ? 'queue' : (args.mode === 'steer' ? 'steer' : config.ask.defaultMode)
         // wake:false 只能用 queue 投递：steer 的语义就是"唤醒它当前回合的下一步"
         const mode = wake ? requestedMode : 'queue'
+        // 目标由子 agent 路由持有 → 宿主必拒；提前报清楚并给退路
+        await assertDeliverable(sessionId, exec)
         // 提问才包窄指令；答复本身就是内容，包上反而啰嗦
         const narrow = !reply && config.ask.narrow
         const bodyText = narrow ? render(config.ask.narrowTemplate, { question: text }) : text
@@ -948,12 +977,16 @@ function buildTools(api, config) {
           ? 'unknown'
           : (projected >= 80 ? 'likely' : 'low')
 
-        await api.sessionController.prompt({
-          requestId: messageId,
-          sessionId,
-          mode,
-          content: textBlocks(body),
-        }, signalOf(exec))
+        try {
+          await api.sessionController.prompt({
+            requestId: messageId,
+            sessionId,
+            mode,
+            content: textBlocks(body),
+          }, signalOf(exec))
+        } catch (error) {
+          throw asDeliveryError(error, sessionId)
+        }
 
         api.guard.record(senderId, sessionId)
 

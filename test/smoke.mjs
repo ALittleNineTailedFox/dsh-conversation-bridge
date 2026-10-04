@@ -172,6 +172,11 @@ function createHarness(options = {}) {
       if (signal === undefined || typeof signal.throwIfAborted !== 'function') {
         throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
       }
+      // 忠实复刻宿主围栏：子 agent 会话不接受投递（hasApiSessionSubagentOwner）
+      const target = summaries.find((item) => item.sessionId === request.sessionId)
+      if (target?.origin === 'subagent' || options.heldTarget === request.sessionId) {
+        throw new Error(`session "${request.sessionId}" is owned by subagent routing`)
+      }
       calls.prompt.push(request)
       append(request.sessionId, {
         type: 'user/message', time: 2000,
@@ -613,6 +618,31 @@ assert.deepEqual(inject, ['tools'])
   assert.equal(asked.accepted, true)
   const replied = await tools2.get('conversation_send').execute({ sessionId: 'session-X', text: 'Y 回 X', reply: true }, execY)
   assert.equal(replied.accepted, true)
+}
+
+/* 9c. 投递围栏：子 agent 会话 / 被活子 agent 持有的会话都不能投，且要说人话 */
+{
+  const harness = createHarness()
+  apply(harness.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  const tools = toolMap(harness.tools)
+  const asB = { agent: { session: { id: 'session-bbb', header: {} } } }
+
+  // 目标是子 agent 会话 → 提前拒，且不浪费一次 prompt
+  const before = harness.calls.prompt.length
+  await assert.rejects(
+    () => tools.get('conversation_send').execute({ sessionId: 'session-sub', text: '在吗' }, asB),
+    /由子 agent 路由持有/,
+  )
+  assert.equal(harness.calls.prompt.length, before, '预检命中时不应真去投递')
+
+  // 目标正被一个活着的子 agent 持有 → 宿主会拒，插件要把宿主的话翻译成可操作提示
+  const held = createHarness({ heldTarget: 'session-aaa' })
+  apply(held.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  const heldSend = toolMap(held.tools).get('conversation_send')
+  await assert.rejects(
+    () => heldSend.execute({ sessionId: 'session-aaa', text: '在吗' }, asB),
+    /由子 agent 路由持有|等它那个子 agent 跑完/,
+  )
 }
 
 /* 10. 只读不唤醒：只读工具全程不得碰 resolveAgent */
