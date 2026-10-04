@@ -295,9 +295,21 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 - JSON Schema 子集：`type` / `oneOf` / `properties` / `required` / `additionalProperties` / `items` / `enum` / `const` + 注解（`description`/`title`）。
   **不支持** `format`、`default`、type 数组。子 schema 必须显式带 `type`。
 - `ctx` 服务用 `ctx.get('<name>')` 取（可缺省时返回 undefined），硬依赖才写进 `inject`。
+- **★ 不要在 `apply` 里用 `ctx.get()` 探测服务是否可用**（2026-10-04 真机踩到，已在 v2 修正）：
+  冷启动时 Cordis 的加载顺序**不保证** `sessionController` 已注册，探测会得到 `undefined`，
+  于是工具被**静默跳过**。现象极具误导性——
+  `plugin_manager list_plugins` 显示该 entry `enabled: true` / `fiberPhase: "active"`（挂载成功），
+  但 `Tool.listTools` 里**一个工具都没有**；只有翻宿主日志才能看到那句降级警告。
+  正确做法：`ctx.inject(['sessionController'], (scoped) => { ... 在 scoped.tools 上注册 ... })`，
+  让注册发生在服务就绪之后；不依赖会话服务的本地工具（交接件读写）立即注册。
+- **排查插件是否真的加载了**：宿主日志在 `<宿主日志根>\logs\host\dsh-<日期>.log`
+  （错误另见 `dsh-<日期>.error.log`），插件自己的 `ctx.logger.*` 行带 `[<插件名>]` 前缀，可直接搜。
+  比 `list_plugins` 的 `fiberPhase` 更能说明"到底跑没跑、跑成什么样"。
 - 插件清单：`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml` 插入一行；`apply(ctx, config)` 导出 `name` / `inject`。
 - 安装：`plugin_manager install_bundle`，target 传**包名**（传绝对路径二次安装会报 `ambiguous-install`）。
 - 已装包重装返回 `application: "restart-required"` ⇒ **代码与配置改动都要重启才生效**。
+- `Config.listConfigs` 目录里的 `status: "absent"` 指的是**该插件没有声明 Config schema**，
+  **不是**"没挂载"——别被它误导（v2 未导出 `Config`，所以是 `absent`）。
 
 ---
 

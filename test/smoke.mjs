@@ -181,6 +181,9 @@ function createHarness(options = {}) {
 
   const tools = []
   const listeners = new Map()
+  const pendingInjections = []
+  /** 哪些服务"此刻已注册"——用来复刻冷启动时服务后到的情况。 */
+  const live = new Set(options.bare === true ? [] : ['sessionController', 'agents', 'sessionProjections', 'tokenMeter'])
   let pressureState
   const agentsService = {
     get: (id) => liveAgents.get(String(id)),
@@ -195,8 +198,17 @@ function createHarness(options = {}) {
       listeners.set(event, list)
       return () => {}
     },
+    /** 复刻 Cordis：依赖满足才跑回调，否则挂起等依赖就绪。 */
+    inject(names, callback) {
+      if (names.every((name) => live.has(name))) {
+        callback(ctx)
+        return () => {}
+      }
+      pendingInjections.push({ names, callback })
+      return () => {}
+    },
     get(key) {
-      if (options.bare === true) return undefined
+      if (!live.has(key)) return undefined
       if (key === 'sessionController') return controller
       if (key === 'agents') return agentsService
       if (key === 'sessionProjections') {
@@ -216,6 +228,19 @@ function createHarness(options = {}) {
     },
     /** 设置当前会话的 live 上下文压力（readOwnPressure 走这条）。 */
     setPressure(state) { pressureState = state },
+    /** 让某个宿主服务"现在才注册"（复刻冷启动顺序），并跑掉因此就绪的注入。 */
+    setLive(name, value) {
+      if (value) live.add(name)
+      else live.delete(name)
+      if (!value) return
+      for (let index = pendingInjections.length - 1; index >= 0; index--) {
+        const entry = pendingInjections[index]
+        if (entry.names.every((dependency) => live.has(dependency))) {
+          pendingInjections.splice(index, 1)
+          entry.callback(ctx)
+        }
+      }
+    },
     /** 触发 session/event（水位提醒靠它）。 */
     fire(session, type) {
       for (const listener of listeners.get('session/event') ?? []) listener(session, { type })
@@ -473,11 +498,32 @@ assert.deepEqual(inject, ['tools'])
   assert.doesNotMatch(body, /mnemon|memorySinks|记忆插件/, '绝不能提及任何记忆插件')
 }
 
-/* 12. 降级：没有 sessionController 时不注册工具、不抛错 */
+/* 12. 降级与"服务后到"：
+   a) 完全没有宿主服务 → 只留不依赖会话服务的本地工具（交接件读写），不抛错
+   b) sessionController 冷启动时未就绪 → 本地工具先注册，服务就绪后跨对话工具补上
+   —— (b) 是真机上踩到的坑：apply 里用 ctx.get() 探测会把工具静默丢掉 */
 {
-  const harness = createHarness({ bare: true })
-  apply(harness.ctx, {})
-  assert.equal(harness.tools.length, 0)
+  const bare = createHarness({ bare: true })
+  apply(bare.ctx, {})
+  assert.deepEqual(
+    bare.tools.map((definition) => definition.name).sort(),
+    ['conversation_handoff_write', 'conversation_handoffs'],
+    '没有宿主服务时应保留本地交接件工具',
+  )
+
+  const late = createHarness()
+  late.setLive('sessionController', false)
+  apply(late.ctx, { handoff: { cooldownMs: 0 } })
+  assert.deepEqual(
+    late.tools.map((definition) => definition.name).sort(),
+    ['conversation_handoff_write', 'conversation_handoffs'],
+    'sessionController 未就绪时，跨对话工具不得注册，但本地工具必须已经注册',
+  )
+  late.setLive('sessionController', true)
+  const names = late.tools.map((definition) => definition.name)
+  assert.equal(names.length, 9, 'sessionController 就绪后应补齐跨对话工具')
+  assert.ok(names.includes('conversation_ask'))
+  assert.equal(new Set(names).size, 9, '不得重复注册')
 }
 
 /* 13. 配置合并 */

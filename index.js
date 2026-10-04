@@ -196,6 +196,9 @@ function tool(options) {
     description: options.description,
     parameters: options.parameters,
     output: { schema: options.output.schema, render: options.output.render },
+    // 默认按"需要会话服务"处理：这类工具要等 sessionController 就绪再注册。
+    // 纯文件类工具显式传 requiresController: false。
+    requiresController: options.requiresController !== false,
     async execute(args, exec) {
       return options.execute(isRecord(args) ? args : {}, exec)
     },
@@ -896,6 +899,7 @@ function buildTools(api, config) {
      * ---------------------------------------------------------------- */
     tool({
       name: 'conversation_handoffs',
+      requiresController: false,
       description:
         '读本插件自己留存的交接件。不给 file 时给目录页（每个交接件的创建时间、来源对话、四段首行）；'
         + '给 file 时读全文。这是"已经合上的旧书"的读后感，配合 conversation_outline/search 翻正文。'
@@ -960,6 +964,7 @@ function buildTools(api, config) {
      * ---------------------------------------------------------------- */
     tool({
       name: 'conversation_handoff_write',
+      requiresController: false,
       description:
         '把该留下的写成交接件（固定四段，逐字标题由插件负责渲染）。四段都要写实、写具体；'
         + '某段为空或过短会被**拒绝写入**并告诉你缺哪段。写完后把返回的文件路径传给 conversation_start 的 handoffFile。'
@@ -1121,6 +1126,13 @@ export function apply(ctx, input = {}) {
         /* 日志失败不影响功能 */
       }
     },
+    info(message) {
+      try {
+        ctx.logger?.info?.(`${PLUGIN}: ${message}`)
+      } catch {
+        /* 日志失败不影响功能 */
+      }
+    },
     /** 交接件写出去之后，本对话在该时长内不再被提醒。 */
     markHandedOff(sessionId) {
       const id = sessionId === undefined || sessionId === null ? '' : String(sessionId)
@@ -1197,18 +1209,27 @@ export function apply(ctx, input = {}) {
   }
 
   /* ---- 工具 ---- */
-  let registered = 0
-  if (config.exposeTools && host.available()) {
-    for (const definition of buildTools(api, config)) {
-      ctx.tools.register(definition)
-      registered += 1
-    }
-  } else if (config.exposeTools) {
-    api.warn('当前部署没有 sessionController 服务，跨对话工具未注册（插件仍正常加载，水位提醒仍可用）')
+  //
+  // 重要教训（2026-10-04 真机）：**不要在 apply 里用 ctx.get() 探测服务是否可用**。
+  // 冷启动时 Cordis 的加载顺序不保证 sessionController 已注册，探测会得到 undefined，
+  // 于是工具被静默跳过（现象：entry 的 fiberPhase=active，但一个工具都没注册）。
+  // 正确做法是用 ctx.inject([...], cb) 等服务就绪再注册。
+  if (config.exposeTools) {
+    const definitions = buildTools(api, config)
+    const fileTools = definitions.filter((definition) => definition.requiresController !== true)
+    const sessionTools = definitions.filter((definition) => definition.requiresController === true)
+
+    for (const definition of fileTools) ctx.tools.register(definition)
+    if (fileTools.length > 0) api.info(`已注册 ${fileTools.length} 个本地工具（无会话服务依赖）`)
+
+    ctx.inject(['sessionController'], (scoped) => {
+      for (const definition of sessionTools) scoped.tools.register(definition)
+      api.info(`sessionController 就绪，已注册 ${sessionTools.length} 个跨对话工具`)
+    })
   }
 
   ctx.logger?.info?.(
-    `${PLUGIN}: 已启用（工具 ${registered} 个；水位提醒 ${config.handoff.enabled ? `${Math.round(config.handoff.threshold * 100)}%` : '关'}；`
+    `${PLUGIN}: 已启用（水位提醒 ${config.handoff.enabled ? `${Math.round(config.handoff.threshold * 100)}%` : '关'}；`
     + `交接件目录 ${config.handoff.dir === '' ? '（跟随会话工作目录）' : config.handoff.dir}）`,
   )
 }
