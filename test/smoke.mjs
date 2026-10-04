@@ -95,6 +95,7 @@ function createHarness(options = {}) {
   let compactionOnNextReply = false
   let replyOnNextPrompt = true
   let noiseOnNextPrompt = false
+  let nonHumanNoiseOnNextPrompt = false
 
   const eventsOf$ = (id) => logs.get(id) ?? []
   const cursorOf = (id) => eventsOf$(id).length - 1
@@ -122,8 +123,7 @@ function createHarness(options = {}) {
       if (request?.sessionId === undefined) throw new Error('projections 需要 sessionId')
       calls.projections.push(request.sessionId)
       const row = summaries.find((item) => item.sessionId === request.sessionId)
-      // 忠实复刻宿主围栏：子 agent 会话没有传父地址的入口，projections 读不到
-      if (row?.origin === 'subagent') throw new Error('subagent Sessions require their durable parent address')
+      // 实测口径：围栏只在 page 上；projections / inspect 对子 agent 会话照样能读
       if (!logs.has(request.sessionId)) return null
       return {
         asOfSeq: cursorOf(request.sessionId),
@@ -134,8 +134,6 @@ function createHarness(options = {}) {
       }
     },
     async inspect(sessionId) {
-      const row = summaries.find((item) => item.sessionId === sessionId)
-      if (row?.origin === 'subagent') throw new Error('subagent Sessions require their durable parent address')
       return { meta: { id: sessionId }, inheritedEventCount: 0, events: eventsOf$(sessionId) }
     },
     async page(request, signal) {
@@ -185,6 +183,10 @@ function createHarness(options = {}) {
         }
         if (noiseOnNextPrompt) {
           append(request.sessionId, { type: 'user/message', time: 2004, data: { content: [{ type: 'text', text: '用户同时插了一句话' }], source: { kind: 'user', rpcId: 'someone-else' } } })
+        }
+        if (nonHumanNoiseOnNextPrompt) {
+          // 复刻真实宿主会写的模型切换提示：user 角色，但 source.kind 不是 user
+          append(request.sessionId, { type: 'user/message', time: 2004, data: { content: [{ type: 'text', text: '[model changed: ...]' }], source: { kind: 'model-selection', form: 'notice' } } })
         }
         append(request.sessionId, { type: 'assistant/message', time: 2005, data: { message: { content: [{ type: 'text', text: '答复：结论 Z' }] } } })
       }
@@ -263,6 +265,7 @@ function createHarness(options = {}) {
       set compactionOnNextReply(value) { compactionOnNextReply = value },
       set replyOnNextPrompt(value) { replyOnNextPrompt = value },
       set noiseOnNextPrompt(value) { noiseOnNextPrompt = value },
+      set nonHumanNoiseOnNextPrompt(value) { nonHumanNoiseOnNextPrompt = value },
     },
     /** 设置当前会话的 live 上下文压力（readOwnPressure 走这条）。 */
     setPressure(state) { pressureState = state },
@@ -458,13 +461,20 @@ assert.deepEqual(inject, ['tools'])
   assert.ok(compacted.compactionPoints.some((point) => point.seq < compacted.replySeq), '压缩点必须早于答复')
   harness.flags.compactionOnNextReply = false
 
-  // 有并发输入 → unknown（宁可多翻一次书）
+  // 有并发输入（真人插话）→ unknown（宁可多翻一次书）
   harness.flags.noiseOnNextPrompt = true
   const asked4 = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '有噪声的问题' }, as('session-eee'))
   const noisy = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked4.askId }, exec)
   assert.equal(noisy.trust, 'unknown')
   assert.equal(noisy.reason, 'concurrent-input')
   harness.flags.noiseOnNextPrompt = false
+
+  // 但**非真人**的 user 角色消息（模型切换提示等）不得算成并发噪声
+  harness.flags.nonHumanNoiseOnNextPrompt = true
+  const asked5 = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '有系统注入的问题' }, as('session-fff'))
+  const injected = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked5.askId }, exec)
+  assert.notEqual(injected.trust, 'unknown', '模型切换提示这类注入不得把 trust 打成 unknown')
+  harness.flags.nonHumanNoiseOnNextPrompt = false
 
   // 不给 askId → 只能给 unknown，不得假装可信
   const bare = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, exec)
@@ -781,10 +791,11 @@ async function tempDir() {
     { sessionId: 'session-sub', parentSessionId: 'session-aaa', mode: 'continuable', limit: 10 }, exec)
   assert.ok(explicit.messages.length > 0)
 
-  // 占用投影对子 agent 会话读不到 → 如实报 available:false，而不是抛错
+  // 占用：实测口径是围栏只在 page 上，projections 照样能读（返回 cached 值）
   const context = await tools.get('conversation_context').execute({ sessionId: 'session-sub' }, exec)
-  assert.equal(context.available, false)
-  assert.equal(context.source, 'unknown')
+  assert.equal(context.available, true)
+  assert.equal(context.source, 'cached')
+  assert.equal(context.scannedRange.reachedStart, true)
 }
 
 /* 19. atSeq 必须精确：指到非消息事件时报错，不许静默给别的位置 */

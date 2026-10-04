@@ -40,9 +40,10 @@ const DEFAULT_REMINDER = `<context_handoff level="warning">
 ⚠️ 本对话上下文已用到 {{percent}}%（约 {{tokens}} / {{window}} tokens，阈值 {{threshold}}%）。
 
 请按顺序做三件事：
-1. **把这件该留下的落成交接件**：调用 {{writeTool}}；四段都要写实、写具体——
-   ${DEFAULT_SECTIONS.join(' / ')}。写不下的细节不怕，原文留在日志里，下个对话能翻回来。
-2. **开新对话接上**：调用 conversation_start，把交接件全文放进 message，并传 handoffFile = 第 1 步返回的文件路径。
+1. **把这件该留下的落成交接件**（四段都要写实、写具体：${DEFAULT_SECTIONS.join(' / ')}）。
+   若 \`conversation_handoff_write\` 可用就直接调用它；**不可用（例如本会话看不到该工具）就用你惯用的写文件工具**，
+   写到 \`{{handoffDir}}\` 下，四段标题要逐字对上。写不下的细节不怕，原文留在日志里，下个对话能翻回来。
+2. **开新对话接上**：调用 conversation_start，把交接件全文放进 message，并传 handoffFile = 交接件路径。
    本对话 sessionId = \`{{sessionId}}\`，工作目录 = \`{{cwd}}\`。
 3. **告诉用户**：已交接、新对话的 sessionId 是返回值里的那个、本对话仍可被回问。
 
@@ -655,10 +656,15 @@ function buildTools(api, config) {
         }),
         render: (_args, value) => [{
           type: 'text',
-          text: value.hits.length === 0
-            ? `对话 ${value.sessionId} 里没有命中（扫描 ${value.scanned} 条消息${value.truncated ? '，且已达到扫描上限' : ''}）。`
+          text: (value.hits.length === 0
+            ? `对话 ${value.sessionId} 里没有命中（扫描 ${value.scanned} 条消息${value.truncated ? '，且已达到扫描上限' : ''}）。\n`
             : `对话 ${value.sessionId} 命中 ${value.hits.length} 条：\n\n`
-              + value.hits.map((hit) => `[seq=${hit.seq} ${hit.role}] ${hit.snippet}`).join('\n\n'),
+              + value.hits.map((hit) => `[seq=${hit.seq} ${hit.role}] ${hit.snippet}`).join('\n\n')
+              + '\n')
+            + renderScannedRange(value.scannedRange)
+            + `扫描到 ${value.scanned} 条消息`
+            + (value.scannedRange?.reachedStart === false ? '；**未扫到会话开头**，更早处可能还有' : '')
+            + (value.truncated ? '；已达到扫描上限，请缩小范围或加大 maxPages' : ''),
         }],
       },
       async execute(args, exec) {
@@ -854,7 +860,7 @@ function buildTools(api, config) {
             + `askId=${value.askId}（读答复要用它）\n`
             + `对方占用${value.occupancyBefore?.percent === undefined ? '未知（该项目标没有可读的占用投影）' : ` ${value.occupancyBefore.percent}%（来源 ${value.occupancyBefore.source}）`}`
             + `${value.projectedAfterPercent === undefined ? '' : `，加上这一问预计 ${value.projectedAfterPercent}%`}`
-            + `，压缩风险：${value.compactionRisk}\n`
+            + `，compactionRisk=${value.compactionRisk}\n`
             + `${value.compactionRisk === 'likely' ? '⚠️ 这一问很可能把它推过压缩线，答复可能失真——拿到后看 trust，必要时翻旧书比对。\n' : ''}`
             + `稍后用 conversation_read（sessionId=${value.sessionId}，askId=${value.askId}）读取答复与可信度。`,
         }],
@@ -1345,6 +1351,8 @@ export function apply(ctx, input = {}) {
       state.armed = false
       state.lastRemindedAt = now
       const cwd = typeof session.header?.cwd === 'string' ? session.header.cwd : ''
+      // 提醒里给出真实落盘目录：即使本会话看不到交接件工具，模型也能用惯用的写文件工具落到这里
+      const handoffDir = resolveDir(config.handoff.dir, cwd)
       const text = render(config.handoff.reminderText, {
         percent: pressure.percent,
         tokens: pressure.tokens,
@@ -1355,6 +1363,7 @@ export function apply(ctx, input = {}) {
         writeTool: config.handoff.toolEnabled
           ? '`conversation_handoff_write`（四段各写一段）'
           : '你惯用的写文件工具（把四段写成 Markdown 小节）',
+        handoffDir,
       })
       queueMicrotask(() => {
         controller.prompt({
