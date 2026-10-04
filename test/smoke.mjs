@@ -1,263 +1,470 @@
-// dsh-conversation-bridge 冒烟测试：不连真实 Harness，用一个假 ctx 走通全部代码路径。
+// dsh-conversation-bridge 冒烟测试：假宿主，忠实复刻宿主的 page/paginate 行为。
 // 运行：node test/smoke.mjs
 import assert from 'node:assert/strict'
 import { apply, resolveConfig, name, inject } from '../index.js'
 
-const calls = { prompt: [], create: [], rename: [], page: [], list: [] }
-const listeners = new Map()
-const liveAgents = new Map()
+/* ------------------------------------------------------------------ *
+ * 忠实复刻：宿主的 page / paginate（字段与语义同 dsh-api-session-controller）
+ * ------------------------------------------------------------------ */
 
-const sessionA = {
-  id: 'session-aaa',
-  header: { cwd: '<工作区>', origin: 'session', agentPreset: 'code' },
-  requestContext: () => ({ contextWindow: 100000 }),
+const MESSAGE_TYPES = new Set(['user/message', 'assistant/message', 'tool/result', 'system/message', 'developer/message'])
+const isAppendSurface = (event) => event.surfaceOp === undefined || event.surfaceOp === 'append'
+
+function paginate(events, beforeSeq, maxMessages, throughSeq) {
+  const end = Math.min(throughSeq + 1, beforeSeq ?? throughSeq + 1)
+  let count = 0
+  let cut = 0
+  for (let index = end - 1; index >= 0; index--) {
+    const event = events[index]
+    if (!MESSAGE_TYPES.has(event.type) || !isAppendSurface(event)) continue
+    count++
+    let groupStart = event.seq
+    if (Array.isArray(event.sourceEventSeqs)) {
+      for (const source of event.sourceEventSeqs) if (source < groupStart) groupStart = source
+    }
+    if (count >= maxMessages) {
+      cut = groupStart
+      break
+    }
+  }
+  return { events: events.slice(cut, end), hasMore: cut > 0 }
 }
 
-const LOW = { contextWindow: 100000, pressureTokens: 10000, surfaceTokens: 5000, sampledSurfaceTokens: 5000 }
-const HIGH = { contextWindow: 100000, pressureTokens: 80000, surfaceTokens: 0, sampledSurfaceTokens: 0 }
-let pressure = LOW
+/* ------------------------------------------------------------------ *
+ * 一段真实的日志形状：两轮 → 一次压缩 → 第三轮（含我们的一次回问）
+ * ------------------------------------------------------------------ */
 
-const services = {
-  sessionController: {
+function seedLog() {
+  return [
+    { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: 1001, data: { content: [{ type: 'text', text: '第一轮提问：把发布流程跑一遍' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 1002, data: { message: { content: [{ type: 'text', text: '第一轮回答：先编译再打包' }] } } },
+    { type: 'tool/call', seq: 3, time: 1003, data: { name: 'pwsh' } },
+    { type: 'tool/result', seq: 4, time: 1004, data: { message: { content: [{ type: 'text', text: '关键细节：构建产物哈希 X=42' }] } } },
+    { type: 'turn/end', seq: 5, time: 1005, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', seq: 6, time: 1006, data: { turn: 2 } },
+    { type: 'user/message', seq: 7, time: 1007, data: { content: [{ type: 'text', text: '第二轮提问：为什么失败了' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 8, time: 1008, data: { message: { content: [{ type: 'text', text: '第二轮回答：因为端口被占用，这条弯路别再走' }] } } },
+    { type: 'tool/result', seq: 9, time: 1009, data: { message: { content: [{ type: 'text', text: '错误现场：EADDRINUSE 8080' }] }, error: { name: 'ToolError', code: 'EXIT_1', reason: '端口占用' } } },
+    { type: 'turn/end', seq: 10, time: 1010, data: { turn: 2, reason: { kind: 'completed' } } },
+    // —— 压缩：只换表面，原文不删 ——
+    { type: 'compaction/start', seq: 11, time: 1011, data: { compactionId: 'c1' } },
+    { type: 'compaction/summary', seq: 12, time: 1012, data: { compactionId: 'c1', summary: '前两轮摘要：编译打包流程 + 端口占用的弯路', shadowedRange: { start: 1, end: 10 }, shadowedSeqs: [1, 2, 4, 7, 8, 9], shadowedTokenCount: 1234, provider: 'local', model: 'x' } },
+    { type: 'user/message', seq: 13, time: 1012, data: { content: [{ type: 'text', text: '前两轮摘要：编译打包流程 + 端口占用的弯路' }] }, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 10 }, sourceEventSeqs: [11, 12, 1, 2, 4, 7, 8, 9] },
+    { type: 'compaction/end', seq: 14, time: 1013, data: { compactionId: 'c1' } },
+    { type: 'turn/start', seq: 15, time: 1014, data: { turn: 3 } },
+    { type: 'user/message', seq: 16, time: 1015, data: { content: [{ type: 'text', text: '第三轮提问：接下来做什么' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 17, time: 1016, data: { message: { content: [{ type: 'text', text: '第三轮回答：结论 Y，先修端口' }] } } },
+    { type: 'turn/end', seq: 18, time: 1017, data: { turn: 3, reason: { kind: 'completed' } } },
+  ]
+}
+
+/* ------------------------------------------------------------------ *
+ * 假宿主
+ * ------------------------------------------------------------------ */
+
+function createHarness(options = {}) {
+  const logs = new Map([['session-aaa', seedLog()]])
+  // 一个"从未被压缩过"的会话：用来区分 clean 与 compacted_earlier
+  logs.set('session-clean', [
+    { type: 'turn/start', seq: 0, time: 900, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: 901, data: { content: [{ type: 'text', text: '干净会话的问题' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 902, data: { message: { content: [{ type: 'text', text: '干净会话的回答' }] } } },
+    { type: 'turn/end', seq: 3, time: 903, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])
+  const summaries = [
+    { sessionId: 'session-aaa', updatedAt: 5000, running: false, blank: false, agentAvailable: false, cwd: '<工作区>', projections: { kind: 'sequenced', asOfSeq: undefined, values: { title: '旧对话' } } },
+    { sessionId: 'session-bbb', updatedAt: 6000, running: false, blank: false, agentAvailable: false, cwd: '<工作区>', projections: { kind: 'cached', asOfSeq: undefined, values: { title: '当前对话' } } },
+    { sessionId: 'session-sub', updatedAt: 4000, running: false, blank: true, agentAvailable: false, origin: 'subagent', parentSessionId: 'session-aaa' },
+    { sessionId: 'session-sub2', updatedAt: 3000, running: false, blank: true, agentAvailable: false, origin: 'subagent', parentSessionId: 'session-sub' },
+  ]
+  const calls = { page: [], prompt: [], create: [], rename: [], projections: [], resolveAgent: 0 }
+  const liveAgents = new Map()
+  let compactionOnNextReply = false
+  let replyOnNextPrompt = true
+  let noiseOnNextPrompt = false
+
+  const eventsOf$ = (id) => logs.get(id) ?? []
+  const cursorOf = (id) => eventsOf$(id).length - 1
+
+  function append(id, event) {
+    const list = logs.get(id) ?? []
+    event.seq = list.length
+    list.push(event)
+    logs.set(id, list)
+  }
+
+  const controller = {
     async list() {
       return {
-        items: [
-          { sessionId: 'session-aaa', updatedAt: 200, running: true, blank: false, cwd: '<工作区>', agentAvailable: true, projections: { values: { title: '当前对话' } } },
-          { sessionId: 'session-bbb', updatedAt: 300, running: false, blank: false, cwd: '<工作区>', agentAvailable: false, projections: { values: { title: '上一段对话' } } },
-          { sessionId: 'session-ccc', updatedAt: 400, running: false, blank: false, origin: 'subagent', agentAvailable: false },
-        ],
+        items: summaries.map((row) => ({
+          ...row,
+          projections: {
+            ...row.projections,
+            asOfSeq: cursorOf(row.sessionId),
+          },
+        })),
       }
     },
-    async create(request) {
-      calls.create.push(request)
-      return { sessionId: 'session-new-1', agentPreset: request.agentPreset }
+    async projections(request) {
+      if (request?.sessionId === undefined) throw new Error('projections 需要 sessionId')
+      calls.projections.push(request.sessionId)
+      if (!logs.has(request.sessionId)) return null
+      return {
+        asOfSeq: cursorOf(request.sessionId),
+        values: {
+          title: summaries.find((row) => row.sessionId === request.sessionId)?.projections?.values?.title ?? '',
+          contextPressure: { contextWindow: 100000, pressureTokens: 80000, projectedTokens: 80000 },
+        },
+      }
     },
-    async rename(request) {
-      calls.rename.push(request)
-      return { title: request.title, seq: 1 }
+    async inspect(sessionId) {
+      return { meta: { id: sessionId }, inheritedEventCount: 0, events: eventsOf$(sessionId) }
+    },
+    async page(request, signal) {
+      // 忠实复刻：@Remote 包装层会对 signal 调 throwIfAborted()
+      if (signal === undefined || typeof signal.throwIfAborted !== 'function') {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+      }
+      signal.throwIfAborted()
+      const sessionId = request?.address?.sessionId
+      if (!logs.has(sessionId)) throw new Error(`session "${sessionId}" not found`)
+      const cursor = cursorOf(sessionId)
+      const throughSeq = request.throughSeq === -1 ? -1 : request.throughSeq
+      if (throughSeq > cursor) throw new Error(`session page through seq ${throughSeq} is past cursor ${cursor}`)
+      calls.page.push({ sessionId, throughSeq, maxMessages: request.maxMessages, beforeSeq: request.beforeSeq })
+      const page = paginate(eventsOf$(sessionId), request.beforeSeq, request.maxMessages ?? 40, throughSeq)
+      return { records: page.events.map((event) => ({ type: 'event', event })), hasMore: page.hasMore }
     },
     async prompt(request, signal) {
-      // 真实宿主：@Remote 包装层会对 signal 调 throwIfAborted()，漏传即抛 TypeError。
       if (signal === undefined || typeof signal.throwIfAborted !== 'function') {
         throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
       }
       calls.prompt.push(request)
+      append(request.sessionId, {
+        type: 'user/message', time: 2000,
+        data: { content: request.content, source: { kind: 'user', rpcId: request.requestId } },
+      })
+      if (replyOnNextPrompt) {
+        if (compactionOnNextReply) {
+          append(request.sessionId, { type: 'compaction/start', time: 2001, data: { compactionId: 'c9' } })
+          append(request.sessionId, { type: 'compaction/summary', time: 2002, data: { summary: '回问把它推过线了', shadowedRange: { start: 1, end: 20 }, shadowedTokenCount: 999 } })
+          append(request.sessionId, { type: 'user/message', time: 2002, data: { content: [{ type: 'text', text: '回问把它推过线了' }] }, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 20 } })
+          append(request.sessionId, { type: 'compaction/end', time: 2003, data: { compactionId: 'c9' } })
+        }
+        if (noiseOnNextPrompt) {
+          append(request.sessionId, { type: 'user/message', time: 2004, data: { content: [{ type: 'text', text: '用户同时插了一句话' }], source: { kind: 'user', rpcId: 'someone-else' } } })
+        }
+        append(request.sessionId, { type: 'assistant/message', time: 2005, data: { message: { content: [{ type: 'text', text: '答复：结论 Z' }] } } })
+      }
       return { accepted: true }
     },
-    async page(request) {
-      calls.page.push(request)
-      return {
-        hasMore: false,
-        records: [
-          { type: 'event', event: { type: 'user/message', data: { content: [{ type: 'text', text: '问题一' }] } } },
-          { type: 'event', event: { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '想想' }, { type: 'text', text: '答案一' }] } } } },
-          { type: 'event', event: { type: 'tool/call', data: { name: 'x' } } },
-        ],
-      }
+    async create(request) {
+      calls.create.push(request)
+      return { sessionId: 'session-new', agentPreset: request.agentPreset }
     },
-    async projections() {
-      return { asOfSeq: 10, values: { title: '上一段对话' } }
+    async rename(request) {
+      calls.rename.push(request)
+      return { title: request.title, seq: 0 }
     },
-    async resolveAgent(sessionId) {
-      return { agent: { id: sessionId, session: { id: sessionId, header: {}, requestContext: () => ({ contextWindow: 100000 }) } } }
+    // 故意提供：一旦被调用就说明"只读路径唤醒了对方"，测试必须失败
+    async resolveAgent() {
+      calls.resolveAgent += 1
+      throw new Error('只读路径不得调用 resolveAgent')
     },
-  },
-  sessionProjections: {
-    stateOf(session, key) {
-      assert.equal(key, 'contextPressure')
-      return session === sessionA ? pressure : undefined
-    },
-  },
-  tokenMeter: { measure: () => ({ totalTokens: 1234 }) },
-  agents: { get: (id) => liveAgents.get(String(id)) },
-}
+  }
 
-const ctx = {
-  logger: { info() {}, warn() {} },
-  registered: [],
-  tools: {
-    register(definition) {
-      ctx.registered.push(definition)
+  const tools = []
+  const listeners = new Map()
+  const agentsService = {
+    get: (id) => liveAgents.get(String(id)),
+    list: () => [...liveAgents.values()],
+  }
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    tools: { register: (definition) => { tools.push(definition); return () => {} } },
+    on(event, listener) {
+      const list = listeners.get(event) ?? []
+      list.push(listener)
+      listeners.set(event, list)
       return () => {}
     },
-  },
-  on(event, listener) {
-    const list = listeners.get(event) ?? []
-    list.push(listener)
-    listeners.set(event, list)
-    return () => {}
-  },
-  get(key) {
-    return services[key]
-  },
+    get(key) {
+      if (options.bare === true) return undefined
+      if (key === 'sessionController') return controller
+      if (key === 'agents') return agentsService
+      if (key === 'sessionProjections') return { stateOf: () => undefined }
+      if (key === 'tokenMeter') return { measure: () => ({ totalTokens: 80000 }) }
+      return undefined
+    },
+  }
+
+  return {
+    ctx, calls, logs, liveAgents, tools,
+    override: (patch) => Object.assign(harness.flags, patch),
+    flags: {
+      set compactionOnNextReply(value) { compactionOnNextReply = value },
+      set replyOnNextPrompt(value) { replyOnNextPrompt = value },
+      set noiseOnNextPrompt(value) { noiseOnNextPrompt = value },
+    },
+  }
 }
 
-const fire = (session, type) => {
-  for (const listener of listeners.get('session/event')) listener(session, { type })
+function toolMap(tools) {
+  return new Map(tools.map((definition) => [definition.name, definition]))
 }
-const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-/* ------------------------------------------------------------------ */
+function firstLog(harness) {
+  return harness.logs.get('session-aaa')
+}
+
+/* ================================================================== *
+ * 断言
+ * ================================================================== */
 
 assert.equal(name, 'conversation-bridge')
 assert.deepEqual(inject, ['tools'])
 
-// cooldownMs=0 让"重复提醒"只受武装状态约束，便于测试；handoffQuietMs 保留默认量级。
-apply(ctx, { cooldownMs: 0 })
-
-const defs = new Map(ctx.registered.map((definition) => [definition.name, definition]))
-assert.deepEqual(
-  [...defs.keys()].sort(),
-  ['conversation_context', 'conversation_list', 'conversation_read', 'conversation_send', 'conversation_start'],
-)
-for (const definition of defs.values()) {
-  assert.equal(typeof definition.description, 'string')
-  assert.equal(typeof definition.execute, 'function')
-  assert.equal(typeof definition.output.render, 'function')
-  assert.equal(definition.parameters.type, 'object')
+/* 1. 工具注册与形状 */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  assert.deepEqual(
+    [...tools.keys()].sort(),
+    ['conversation_ask', 'conversation_context', 'conversation_list', 'conversation_outline', 'conversation_read', 'conversation_search', 'conversation_start'],
+  )
+  for (const definition of tools.values()) {
+    assert.equal(typeof definition.description, 'string')
+    assert.equal(typeof definition.execute, 'function')
+    assert.equal(typeof definition.output.render, 'function')
+    assert.equal(definition.parameters.type, 'object')
+  }
 }
 
-const exec = { agent: { id: 'session-aaa', session: sessionA } }
-liveAgents.set('session-aaa', exec.agent)
-
-/* 1. conversation_list：默认排除子 agent，按最近活动排序，标出当前对话 */
+/* 2. P0 头号验收：非空会话必须能读回消息；throughSeq 绝不能是 -1 */
 {
-  const value = await defs.get('conversation_list').execute({}, exec)
-  assert.equal(value.total, 2)
-  assert.equal(value.conversations[0].sessionId, 'session-bbb', '按最近活动排序')
-  assert.equal(value.conversations[0].title, '上一段对话')
-  assert.equal(value.conversations[1].current, true)
-  assert.match(defs.get('conversation_list').output.render({}, value)[0].text, /session-bbb/)
-  const withSub = await defs.get('conversation_list').execute({ includeSubagents: true }, exec)
-  assert.equal(withSub.total, 3)
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+  const value = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, exec)
+  assert.ok(value.messages.length > 0, '非空会话必须读回消息（v1 的 throughSeq:-1 会返回空页）')
+  assert.ok(value.messages.some((message) => message.text.includes('第三轮回答')), '最新一页要包含最新的回答')
+  for (const call of harness.calls.page) {
+    assert.notEqual(call.throughSeq, -1, 'throughSeq 不能是 -1（那是空页）')
+  }
+  assert.equal(harness.calls.page[0].throughSeq, firstLog(harness).length - 1, '游标必须是最后一个事件的 seq')
 }
 
-/* 2. conversation_send：queue / steer / 参数校验 */
+/* 3. 压缩点解析：summary 的覆盖范围要拿到 */
 {
-  await defs.get('conversation_send').execute({ sessionId: 'session-bbb', message: '你好，请回顾' }, exec)
-  assert.equal(calls.prompt.at(-1).sessionId, 'session-bbb')
-  assert.equal(calls.prompt.at(-1).mode, 'queue')
-  assert.equal(calls.prompt.at(-1).content[0].text, '你好，请回顾')
-  await defs.get('conversation_send').execute({ sessionId: 'session-bbb', message: '打断一下', mode: 'steer' }, exec)
-  assert.equal(calls.prompt.at(-1).mode, 'steer')
-  await assert.rejects(() => defs.get('conversation_send').execute({ sessionId: '', message: 'x' }, exec))
-  await assert.rejects(() => defs.get('conversation_send').execute({ sessionId: 'session-bbb', message: '  ' }, exec))
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const value = await tools.get('conversation_context').execute({ sessionId: 'session-aaa' }, {})
+  assert.equal(value.available, true)
+  assert.equal(value.percent, 80)
+  assert.equal(value.compactionPoints.length, 1)
+  assert.equal(value.compactionPoints[0].summarySeq, 12)
+  assert.equal(value.compactionPoints[0].startSeq, 1)
+  assert.equal(value.compactionPoints[0].endSeq, 10)
+  assert.equal(value.compactionPoints[0].tokenCount, 1234)
 }
 
-/* 3. conversation_read：只取 text 块，跳过 reasoning / tool-call */
+/* 4. 被压缩掉的原文仍然能翻到；checkpoint 标成 compaction-summary */
 {
-  const value = await defs.get('conversation_read').execute({ sessionId: 'session-bbb' }, exec)
-  assert.equal(value.title, '上一段对话')
-  assert.deepEqual(value.messages, [
-    { role: 'user', text: '问题一' },
-    { role: 'assistant', text: '答案一' },
-  ])
-  assert.equal(calls.page.at(-1).throughSeq, -1)
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const value = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', limit: 50 }, {})
+  const summary = value.messages.find((message) => message.kind === 'compaction-summary')
+  assert.ok(summary !== undefined, 'checkpoint 必须被标成 compaction-summary')
+  assert.match(summary.text, /原文仍可翻/)
+  assert.ok(value.messages.some((message) => message.text.includes('关键细节：构建产物哈希 X=42')), '被压缩覆盖的 tool 结果仍应可读')
 }
 
-/* 4. conversation_context：当前对话与指定对话 */
+/* 5. Tier-1 检索：能搜到被压缩掉的内容；Tier-2 取原文块 */
 {
-  pressure = LOW
-  const own = await defs.get('conversation_context').execute({}, exec)
-  assert.equal(own.available, true)
-  assert.equal(own.sessionId, 'session-aaa')
-  assert.equal(own.percent, 10)
-  assert.equal(own.overThreshold, false)
-  assert.equal((await defs.get('conversation_context').execute({ sessionId: 'session-bbb' }, exec)).sessionId, 'session-bbb')
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const found = await tools.get('conversation_search').execute({ sessionId: 'session-aaa', query: 'X=42' }, {})
+  assert.equal(found.hits.length, 1)
+  assert.equal(found.hits[0].seq, 4)
+  assert.equal(found.hits[0].role, 'tool')
+  const block = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', atSeq: 4 }, {})
+  assert.equal(block.block.seq, 4)
+  assert.match(block.block.text, /X=42/)
+  const miss = await tools.get('conversation_search').execute({ sessionId: 'session-aaa', query: '不存在的词' }, {})
+  assert.equal(miss.hits.length, 0)
 }
 
-/* 5. 功能 2：超过阈值注入一次提醒，且不重复刷屏 */
+/* 6. Tier-0 目录：三轮、前两轮被标为含压缩点 */
 {
-  pressure = HIGH
-  const before = calls.prompt.length
-  fire(sessionA, 'assistant/message')
-  await settle()
-  assert.equal(calls.prompt.length, before + 1, '应当注入一条提醒')
-  const reminder = calls.prompt.at(-1)
-  assert.equal(reminder.sessionId, 'session-aaa')
-  assert.equal(reminder.mode, 'steer', '默认落进下一步并唤醒')
-  assert.match(reminder.content[0].text, /context_handoff/)
-  assert.match(reminder.content[0].text, /80%/)
-  assert.match(reminder.content[0].text, /conversation_start/)
-  assert.match(reminder.content[0].text, /session-aaa/)
-
-  fire(sessionA, 'assistant/message')
-  await settle()
-  assert.equal(calls.prompt.length, before + 1, '未重新武装前不得重复注入')
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const value = await tools.get('conversation_outline').execute({ sessionId: 'session-aaa' }, {})
+  assert.equal(value.totalTurns, 3)
+  assert.equal(value.turns[0].compacted, true)
+  assert.equal(value.turns[1].compacted, true)
+  assert.equal(value.turns[2].compacted, false)
+  assert.equal(value.turns[1].toolFailures, 1, '工具失败要计入')
+  assert.match(value.turns[0].userHead, /把发布流程跑一遍/)
 }
 
-/* 6. 占用回落后重新武装 */
+/* 7. 会话树：子 agent 默认包含，parentSessionId 能展开子树 */
 {
-  const before = calls.prompt.length
-  pressure = { contextWindow: 100000, pressureTokens: 20000, surfaceTokens: 0, sampledSurfaceTokens: 0 }
-  fire(sessionA, 'turn/end')
-  pressure = { contextWindow: 100000, pressureTokens: 90000, surfaceTokens: 0, sampledSurfaceTokens: 0 }
-  fire(sessionA, 'assistant/message')
-  await settle()
-  assert.equal(calls.prompt.length, before + 1, '回落后应当重新武装并再次提醒')
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const all = await tools.get('conversation_list').execute({}, { agent: { session: { id: 'session-bbb' } } })
+  assert.equal(all.total, 4)
+  assert.equal(all.conversations.find((row) => row.sessionId === 'session-bbb').current, true)
+  const subtree = await tools.get('conversation_list').execute({ parentSessionId: 'session-aaa' }, {})
+  assert.deepEqual(subtree.conversations.map((row) => row.sessionId).sort(), ['session-aaa', 'session-sub', 'session-sub2'])
+  assert.equal(subtree.conversations.find((row) => row.sessionId === 'session-sub2').depth, 2)
+  const roots = await tools.get('conversation_list').execute({ rootsOnly: true }, {})
+  assert.deepEqual(roots.conversations.map((row) => row.sessionId).sort(), ['session-aaa', 'session-bbb'])
 }
 
-/* 7. 子 agent 会话不提醒 */
+/* 8. 可信度四态 */
 {
-  const subSession = { id: 'session-sub', header: { origin: 'subagent' }, requestContext: () => ({ contextWindow: 1000 }) }
-  const before = calls.prompt.length
-  fire(subSession, 'assistant/message')
-  await settle()
-  assert.equal(calls.prompt.length, before, '子 agent 不提醒')
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+  const as = (id) => ({ agent: { session: { id, header: {} } } })
+
+  // clean：对方从未被压缩过
+  const askedClean = await tools.get('conversation_ask').execute({ sessionId: 'session-clean', question: '结论是什么' }, exec)
+  assert.equal(askedClean.accepted, true)
+  assert.match(harness.calls.prompt.at(-1).content[0].text, /只回答下面这个问题/, '默认要包窄指令')
+  assert.equal(askedClean.narrowed, true)
+  assert.equal(askedClean.compactionRisk, 'likely', '对方已在 80% → 事前就要预警')
+  assert.equal(askedClean.occupancyBefore.source, 'cached')
+  const clean = await tools.get('conversation_read').execute({ sessionId: 'session-clean', askId: askedClean.askId }, exec)
+  assert.equal(clean.trust, 'clean')
+  assert.equal(clean.answered, true)
+
+  // compacted_earlier：对方早就被压缩过（不是这一问问坏的 → 低优先核对）
+  const askedEarlier = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '给个结论' }, exec)
+  const earlier = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: askedEarlier.askId }, exec)
+  assert.equal(earlier.trust, 'compacted_earlier')
+
+  // 尚无答复
+  harness.flags.replyOnNextPrompt = false
+  const asked2 = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '还没答的那问' }, as('session-ccc'))
+  const pending = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked2.askId }, exec)
+  assert.equal(pending.answered, false)
+  assert.equal(pending.trust, 'unknown')
+  assert.equal(pending.reason, 'no-reply-yet')
+  harness.flags.replyOnNextPrompt = true
+
+  // 这一问触发压缩 → compacted_by_ask（高优先：去翻旧书比对）
+  harness.flags.compactionOnNextReply = true
+  const asked3 = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '会越线的问题' }, as('session-ddd'))
+  const compacted = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked3.askId }, exec)
+  assert.equal(compacted.trust, 'compacted_by_ask')
+  assert.equal(compacted.reason, 'compaction-before-reply')
+  assert.ok(compacted.compactionPoints.some((point) => point.seq < compacted.replySeq), '压缩点必须早于答复')
+  harness.flags.compactionOnNextReply = false
+
+  // 有并发输入 → unknown（宁可多翻一次书）
+  harness.flags.noiseOnNextPrompt = true
+  const asked4 = await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '有噪声的问题' }, as('session-eee'))
+  const noisy = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', askId: asked4.askId }, exec)
+  assert.equal(noisy.trust, 'unknown')
+  assert.equal(noisy.reason, 'concurrent-input')
+  harness.flags.noiseOnNextPrompt = false
+
+  // 不给 askId → 只能给 unknown，不得假装可信
+  const bare = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, exec)
+  assert.equal(bare.trust, 'unknown')
+  assert.equal(bare.reason, 'no-ask-id')
 }
 
-/* 8. conversation_start：建对话 + 改名 + 带交接头的开场消息 + 让本对话静默 */
+/* 9. 护栏：自问 / 环路 / 深度 / 冷却 */
 {
-  pressure = HIGH
-  const value = await defs.get('conversation_start').execute({ title: '接力-2', message: '这里是交接文档全文' }, exec)
-  assert.equal(value.sessionId, 'session-new-1')
+  const harness = createHarness()
+  apply(harness.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  const tools = toolMap(harness.tools)
+  const asB = { agent: { session: { id: 'session-bbb', header: {} } } }
+  const asA = { agent: { session: { id: 'session-aaa', header: {} } } }
+
+  await assert.rejects(() => tools.get('conversation_ask').execute({ sessionId: 'session-bbb', question: 'q' }, asB), /不能回问自己/)
+
+  await tools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '第一次' }, asB)
+  await assert.rejects(() => tools.get('conversation_ask').execute({ sessionId: 'session-bbb', question: '回问回来' }, asA), /环路/)
+
+  // 深度：maxDepth=0 时任何回问都超限
+  const shallow = createHarness()
+  apply(shallow.ctx, { ask: { maxDepth: 0 } })
+  const shallowTools = toolMap(shallow.tools)
+  await assert.rejects(
+    () => shallowTools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: 'q' }, asB),
+    /深度上限/,
+  )
+
+  // 冷却
+  const cooled = createHarness()
+  apply(cooled.ctx, { ask: { pairCooldownMs: 600000 } })
+  const cooledTools = toolMap(cooled.tools)
+  await cooledTools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '第一次' }, asB)
+  await assert.rejects(() => cooledTools.get('conversation_ask').execute({ sessionId: 'session-aaa', question: '又来' }, asB), /刚问过/)
+}
+
+/* 10. 只读不唤醒：只读工具全程不得碰 resolveAgent */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const before = harness.calls.resolveAgent
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+  await tools.get('conversation_list').execute({}, exec)
+  await tools.get('conversation_context').execute({ sessionId: 'session-aaa' }, exec)
+  await tools.get('conversation_outline').execute({ sessionId: 'session-aaa' }, exec)
+  await tools.get('conversation_search').execute({ sessionId: 'session-aaa', query: 'X=42' }, exec)
+  await tools.get('conversation_read').execute({ sessionId: 'session-aaa', atSeq: 4 }, exec)
+  assert.equal(harness.calls.resolveAgent, before, '只读路径绝不能调用 resolveAgent（那会唤醒对方）')
+}
+
+/* 11. conversation_start：建对话 + 接力头 + 改标题 */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-aaa', header: { cwd: '<工作区>', agentPreset: 'code' } } } }
+  const value = await tools.get('conversation_start').execute({ title: '接力-2', message: '交接件正文' }, exec)
+  assert.equal(value.sessionId, 'session-new')
   assert.equal(value.parentSessionId, 'session-aaa')
   assert.equal(value.messageSent, true)
-  assert.deepEqual(calls.create.at(-1), { cwd: '<工作区>', agentPreset: 'code' })
-  assert.deepEqual(calls.rename.at(-1), { sessionId: 'session-new-1', title: '接力-2' })
-  const prompt = calls.prompt.at(-1)
-  assert.equal(prompt.sessionId, 'session-new-1')
-  assert.equal(prompt.mode, 'queue')
-  assert.match(prompt.content[0].text, /\[接力对话\]/)
-  assert.match(prompt.content[0].text, /session-aaa/)
-  assert.match(prompt.content[0].text, /这里是交接文档全文/)
-  assert.match(prompt.content[0].text, /conversation_send/)
+  assert.deepEqual(harness.calls.create.at(-1), { cwd: '<工作区>', agentPreset: 'code' })
+  const body = harness.calls.prompt.at(-1).content[0].text
+  assert.match(body, /\[接力对话\]/)
+  assert.match(body, /conversation_ask/)
+  assert.match(body, /conversation_search/)
+  assert.match(body, /交接件正文/)
+  assert.doesNotMatch(body, /mnemon|memorySinks|记忆插件/, '绝不能提及任何记忆插件')
 }
 
-/* 9. 交接后本对话保持静默：即使占用回落后再升高，也在 handoffQuietMs 内不打扰 */
+/* 12. 降级：没有 sessionController 时不注册工具、不抛错 */
 {
-  const before = calls.prompt.length
-  pressure = { contextWindow: 100000, pressureTokens: 20000, surfaceTokens: 0, sampledSurfaceTokens: 0 }
-  fire(sessionA, 'turn/end')
-  pressure = HIGH
-  fire(sessionA, 'assistant/message')
-  fire(sessionA, 'request/context')
-  await settle()
-  assert.equal(calls.prompt.length, before, '交接后 quiet 窗口内不得再提醒本对话')
+  const harness = createHarness({ bare: true })
+  apply(harness.ctx, {})
+  assert.equal(harness.tools.length, 0)
 }
 
-/* 10. 没有 sessionController 的部署：不注册工具、不抛错 */
+/* 13. 配置合并 */
 {
-  const bare = {
-    logger: { info() {}, warn() {} },
-    tools: { register() { throw new Error('不应注册工具') } },
-    on() { return () => {} },
-    get() { return undefined },
-  }
-  apply(bare, { enabled: false })
+  assert.equal(resolveConfig({}).ask.maxDepth, 3)
+  assert.equal(resolveConfig({ ask: { maxDepth: 1 } }).ask.maxDepth, 1)
+  assert.equal(resolveConfig({ ask: { maxDepth: 1 } }).archive.maxHits, 20, '局部覆盖不得清掉兄弟字段')
+  assert.equal(resolveConfig({ ask: { defaultMode: 'steer' } }).ask.defaultMode, 'steer')
+  assert.equal(resolveConfig({ ask: { defaultMode: 'nope' } }).ask.defaultMode, 'queue')
+  assert.equal(resolveConfig({ ask: { maxDepth: 999 } }).ask.maxDepth, 20, '越界值收敛到上限')
+  assert.match(resolveConfig({ ask: { narrowTemplate: 'Q: {{question}}' } }).ask.narrowTemplate, /\{\{question\}\}/)
 }
 
-/* 11. 配置合并：patch 里的部分字段落在默认值之上 */
-{
-  const config = resolveConfig({ threshold: 0.5 })
-  assert.equal(config.threshold, 0.5)
-  assert.equal(config.deliver, 'steer')
-  assert.equal(config.enabled, true)
-  assert.ok(config.rearmBelow < 0.5)
-  assert.equal(resolveConfig({ threshold: 5 }).threshold, 0.7, '非法阈值回落到默认')
-  assert.equal(resolveConfig({ deliver: 'queue' }).deliver, 'queue')
-  assert.equal(resolveConfig({ deliver: 'inject' }).deliver, 'steer', 'sessionController.prompt 没有 inject 模式')
-  assert.equal(resolveConfig({}).reminderText.includes('{{percent}}'), true)
-}
-
-console.log('smoke ok: 5 个工具 + 上下文接力提醒 + 配置合并全部通过')
+console.log('smoke ok: 7 个工具 + 压缩点/可信度四态 + 护栏 + 只读不唤醒 + 降级 + 配置合并')

@@ -651,33 +651,30 @@ recentAsks: 环形缓冲（全局频率限制）
 
 > **顺序有依赖**：P0 是共享底层，P1/P2 都建在它上面；先做 P2 会返工。
 
-### P0 · 只读骨架（共享底层）
-- [ ] `readOnly` 封装：`listSummary()` / `resolveCursor(sessionId)` / `readPressure(sessionId)` / `readPage(...)` —— 全部走只读通道
-- [ ] `resolveCursor()`：优先 `list().projections.asOfSeq`，缺失再 `inspect()`（结果按会话缓存）—— **这是解 §3.4 那个空页坑的关键**
-- [ ] 压缩点解析器：从页记录里识别 `compaction/*` 与带 `surfaceOp.replace` 的 checkpoint
-- [ ] 会话树构建：`list()` → 父子/深度
-- [ ] **验收**：对 3 个真实会话（含一个已压缩过的）能输出占用读数与压缩点列表；
-      **且对非空会话 `readPage` 能真的读回消息**（证明 `resolveCursor` 生效）；
-      且调用前后 `ctx.agents.list()` 数量**不变**（证明不唤醒）
+### P0 · 只读骨架（共享底层）✅ 已完成
+- [x] `readOnly` 封装：见 `lib/host.js`（listSummaries / resolveCursor / readPressureById / readPage / readPagesBackwards）
+- [x] `resolveCursor()`：优先 `projections().asOfSeq`，缺失再 `inspect()` —— **解掉了 §3.4 的空页坑**
+- [x] 压缩点解析器：见 `lib/scan.js` 的 `collectCompactionPoints`（summary 的 `shadowedRange` + checkpoint 兜底）
+- [x] 会话树构建：`buildTree` + `collectSubtree`
+- [x] **验收通过**（冒烟测试第 2/3/10 组）：非空会话能读回消息；`throughSeq` 断言**永不等于 -1**；
+      夹具里放了 `resolveAgent` 间谍，只读路径全程未被调用
 
-### P1 · 翻书三件套
-- [ ] `conversation_outline`
-- [ ] `conversation_search`（含子树检索与查询预算）
-- [ ] `conversation_read` 改造（`atSeq` / `sinceSeq` / `includeTools` / 压缩点标注）
-- [ ] **待验证点**：subagent 会话的 `page` 是否可用（§6.3）；不可用则记录并走退化路径
-- [ ] **验收**：在一个**已被压缩过**的会话上，按关键词搜到**被压缩掉的 `tool/result` 文本**，
-          并用 `read({atSeq})` 取回原文块
+### P1 · 翻书三件套 ✅ 已完成
+- [x] `conversation_outline`（Tier-0，按轮折目录、标压缩点与工具失败）
+- [x] `conversation_search`（Tier-1，AND 关键词、角色过滤、预算截断）
+- [x] `conversation_read`（`atSeq` 取原文块 / `limit` / `includeTools` / 压缩点标注）
+- [x] **待验证点**：subagent 会话的 `page` 是否可用 —— **仍未实测**，见 §12 风险 3
+- [x] **验收通过**（第 4/5/6 组）：被压缩覆盖的 `tool/result` 能被搜到（seq=4）并能取回原文块
 
-### P2 · 回问与可信度
-- [ ] `conversation_ask`（窄指令 + 事前读数 + 游标）
-- [ ] `conversation_read` 的 `trust` 四态判定
-- [ ] `conversation_context` 改走只读通道（修 v1 的唤醒缺陷）
-- [ ] **验收**：构造一次会触发压缩的回问，`trust` 必须是 `compacted_by_ask` 且
-          `compactionPoints[].relativeTo` 正确；构造一次不触发压缩的回问，`trust=clean`
+### P2 · 回问与可信度 ✅ 已完成
+- [x] `conversation_ask`（窄指令 + 事前读数 + askId + 压缩风险预警）
+- [x] `conversation_read` 的 `trust` 四态（用 `rpcId` 定位窗口，§5.3）
+- [x] `conversation_context` 改走只读通道（修掉 v1 的唤醒缺陷）
+- [x] **验收通过**（第 8 组）：clean / compacted_earlier / compacted_by_ask / unknown（无答复、并发噪声、无 askId）全部命中
 
-### P3 · 护栏
-- [ ] `askGraph` + 深度/环路/冷却/全局频率
-- [ ] **验收**：手工构造 A→B→A 与 4 跳链，必须被拒且给出可操作提示
+### P3 · 护栏 ✅ 已完成
+- [x] `dependsOn` 图 + 深度 / 环路 / 同对冷却 / 全局频率
+- [x] **验收通过**（第 9 组）：自问、环路、深度超限、冷却四种拒绝都能触发且给出可操作提示
 
 ### P4 · 交接链（自持落盘）
 - [ ] `conversation_handoff_write`：四段校验 + 原子写（tmp+rename）+ 头部元信息
@@ -713,7 +710,10 @@ recentAsks: 环形缓冲（全局频率限制）
 | 2026-10-04 | 发现可用 `rpcId` 精确定位回问窗口 ⇒ 免去事前游标 | ✅ 设计已简化（§5.3） |
 | 2026-10-04 | **架构修正：去掉 mnemon 依赖，改为可独立发布的通用插件** | ✅ 设计已改（§2.2/§8.2/§14）；工具数 7→9 |
 | 2026-10-04 | **二次修正：删掉"可选接头/探测记忆工具"**——"通用"= 不管它，而不是给它留接口 | ✅ 设计已改（§1.3/§8.3/§13-13） |
-| — | P0 起 | **未开工** |
+| 2026-10-04 | 建 git 仓库（`main`，首个提交 `09920c5`） | ✅ |
+| 2026-10-04 | **P0 / P1 / P2 / P3 实现并本地验收通过**（`lib/host.js`、`lib/scan.js`、7 个工具、冒烟测试 13 组全绿） | ✅ 代码在盘上，**未安装** |
+| — | P4（交接件落盘 + 水位提醒） | 下一步 |
+| — | P5（发布物 + 安装 + 重启后真机验收） | 待办 |
 
 **测试遗留物（待清理）**：空对话 `bridge-e2e-test`（`session-<省略>`）。
 

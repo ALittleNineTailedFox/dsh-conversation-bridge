@@ -1,73 +1,69 @@
 /**
- * dsh-conversation-bridge — 跨对话通信 + 上下文接力提醒。
+ * dsh-conversation-bridge —— 只管"交接"这一个问题的 DSH 插件。
  *
- * 两个能力：
- *  1. 工具（模型可调用）：`conversation_list` / `conversation_start` /
- *     `conversation_send` / `conversation_read` / `conversation_context`
- *     —— 一个对话可以开新对话、向另一个对话发消息、读另一个对话的最新消息。
- *  2. 监听器：当某个对话的上下文占用达到阈值（默认 70%）时，向该对话注入一条
- *     上下文消息，提醒当前 AI 写交接文档并用 `conversation_start` 开启新对话。
+ * 三条取数通道（设计见 DESIGN.md）：
+ *   1. 交接件（自持落盘，P4）
+ *   2. 回问旧对话 —— conversation_ask，优先
+ *   3. 只读翻旧书 —— conversation_outline / search / read，回退底线
  *
- * 依赖说明：本包刻意不 import 任何 `@deepseek-ai/*` 包（profile 的 node_modules
- * 里只有 cosmokit / schemastery），因此：
- *   - 工具用 `ctx.tools.register` 要求的原始 ToolDefinition 形状手写，不复刻 `defineTool`；
- *   - 消息一律通过官方 `ctx.sessionController.prompt` 准入，不复刻 `createUserMessage`。
- * 唯一的 import 是 Node 内建模块。
+ * 铁律：只读路径绝不唤醒对方；零第三方依赖；不接入、不探测、不提及任何记忆插件。
  *
  * @module dsh-conversation-bridge
  */
 
 import { randomUUID } from 'node:crypto'
+import { createHost, idleSignal, signalOf } from './lib/host.js'
+import {
+  assessTrust,
+  buildOutline,
+  collectCompactionPoints,
+  eventsOf,
+  extractMessages,
+  pointSeq,
+  searchEvents,
+} from './lib/scan.js'
 
 const PLUGIN = 'conversation-bridge'
 
 export const name = PLUGIN
 
-/** 只硬依赖工具注册表；其余服务用 ctx.get() 可选获取，缺失时降级而不是让插件不激活。 */
+/** 只硬依赖工具注册表；其余宿主服务用 ctx.get() 可选获取，缺失即降级。 */
 export const inject = ['tools']
 
-const DEFAULT_REMINDER = `<context_handoff level="warning">
-⚠️ 本对话上下文占用已达 {{percent}}%（约 {{tokens}} / {{window}} tokens，阈值 {{threshold}}%）。
+const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不要改文件、不要展开、不要重做已做过的工作。
+如果结论在你开过的子 agent 手里，直接让那个子 agent 把结论给你，不要自己重跑。
 
-请立刻做三件事：
-1. **写交接文档**：把「当前目标 / 已完成与证据 / 未完成待办 / 关键文件与入口 / 外部阻塞与风险 / 下一步建议 / 本次踩过的坑」写清楚，优先落到工作区里的交接文件（例如 \`_handoff_<主题>.md\`），并在回复里给出摘要。
-2. **开新对话交接**：调用 \`conversation_start\`，把交接文档全文作为 \`message\` 传进去。本对话 sessionId = \`{{sessionId}}\`，工作目录 = \`{{cwd}}\`；插件会自动把「如何回问上一段对话」写进新对话的开场消息。
-3. **告诉用户**：已交接、新对话的 sessionId 是调用返回值里的那个、本对话可以继续用于关键追问。
-
-若当前任务正处在不能中断的改动中途，先把改动落到安全状态（提交 / 落盘）再交接，不要带着未落盘的风险停手。
-</context_handoff>`
-
-const DEFAULT_HANDOFF_HEADER = `[接力对话] 这是一段由上下文接力产生的新对话，接替上一段对话。
-- 上一段对话 sessionId = \`{{parentSessionId}}\`（标题：{{parentTitle}}；工作目录：{{parentCwd}}），交接原因：上下文占用 {{percent}}%。
-- 需要向上一段对话追问：调用 \`conversation_send\`（sessionId=\`{{parentSessionId}}\`，message=你的问题）。
-- 读取它的最新回复：调用 \`conversation_read\`（sessionId=\`{{parentSessionId}}\`）。
-- 查看全部对话：\`conversation_list\`。`
+问题：{{question}}`
 
 const DEFAULTS = Object.freeze({
   exposeTools: true,
-  enabled: true,
-  threshold: 0.7,
-  rearmBelow: 0.55,
-  cooldownMs: 600000,
-  handoffQuietMs: 1800000,
-  deliver: 'steer',
-  skipSubagents: true,
-  handoffHeader: true,
-  inheritCwd: true,
-  inheritPreset: true,
-  listLimit: 30,
-  readLimit: 30,
-  maxMessageChars: 4000,
-  reminderText: DEFAULT_REMINDER,
-  handoffHeaderText: DEFAULT_HANDOFF_HEADER,
+  ask: Object.freeze({
+    maxDepth: 3,
+    pairCooldownMs: 600000,
+    globalPerMinute: 30,
+    defaultMode: 'queue',
+    narrow: true,
+    narrowTemplate: DEFAULT_ASK_TEMPLATE,
+    replyAllowanceTokens: 1500,
+  }),
+  archive: Object.freeze({
+    maxScanEvents: 3000,
+    maxHits: 20,
+    maxBlockChars: 2400,
+    outlineMaxTurns: 50,
+    includeToolResults: true,
+    pageSize: 30,
+    maxPages: 8,
+    listLimit: 30,
+  }),
 })
 
 /* ------------------------------------------------------------------ *
  * 配置
  * ------------------------------------------------------------------ */
 
-function asRecord(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function readBoolean(value, fallback) {
@@ -79,50 +75,42 @@ function readInteger(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(value)))
 }
 
-function readRatio(value, fallback) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-  if (value <= 0 || value >= 1) return fallback
-  return value
-}
-
 function readText(value, fallback) {
   return typeof value === 'string' && value.trim().length > 0 ? value : fallback
 }
 
-/** 用户 patch 里的 config 会整体替换默认 config，所以这里逐字段合并，而不是直接采用它。 */
+/** patch 里的 config 会整体替换默认 config，所以逐字段合并而不是直接采用。 */
 export function resolveConfig(input) {
-  const raw = asRecord(input)
-  const threshold = readRatio(raw.threshold, DEFAULTS.threshold)
-  // 重新武装的线必须严格低于阈值，否则"超过阈值"与"回落到线以下"会同时成立，提醒会被反复触发。
-  const rearmBelow = Math.max(0, Math.min(readRatio(raw.rearmBelow, DEFAULTS.rearmBelow), threshold - 0.01, threshold * 0.9))
+  const raw = isRecord(input) ? input : {}
+  const askRaw = isRecord(raw.ask) ? raw.ask : {}
+  const archiveRaw = isRecord(raw.archive) ? raw.archive : {}
   return {
     exposeTools: readBoolean(raw.exposeTools, DEFAULTS.exposeTools),
-    enabled: readBoolean(raw.enabled, DEFAULTS.enabled),
-    threshold,
-    rearmBelow,
-    cooldownMs: readInteger(raw.cooldownMs, DEFAULTS.cooldownMs, 0, 24 * 3600 * 1000),
-    handoffQuietMs: readInteger(raw.handoffQuietMs, DEFAULTS.handoffQuietMs, 0, 7 * 24 * 3600 * 1000),
-    // sessionController.prompt 只支持 queue（下一轮）与 steer（本回合下一步）
-    deliver: raw.deliver === 'queue' ? 'queue' : 'steer',
-    skipSubagents: readBoolean(raw.skipSubagents, DEFAULTS.skipSubagents),
-    handoffHeader: readBoolean(raw.handoffHeader, DEFAULTS.handoffHeader),
-    inheritCwd: readBoolean(raw.inheritCwd, DEFAULTS.inheritCwd),
-    inheritPreset: readBoolean(raw.inheritPreset, DEFAULTS.inheritPreset),
-    listLimit: readInteger(raw.listLimit, DEFAULTS.listLimit, 1, 200),
-    readLimit: readInteger(raw.readLimit, DEFAULTS.readLimit, 1, 200),
-    maxMessageChars: readInteger(raw.maxMessageChars, DEFAULTS.maxMessageChars, 200, 200000),
-    reminderText: readText(raw.reminderText, DEFAULTS.reminderText),
-    handoffHeaderText: readText(raw.handoffHeaderText, DEFAULTS.handoffHeaderText),
+    ask: {
+      maxDepth: readInteger(askRaw.maxDepth, DEFAULTS.ask.maxDepth, 0, 20),
+      pairCooldownMs: readInteger(askRaw.pairCooldownMs, DEFAULTS.ask.pairCooldownMs, 0, 24 * 3600 * 1000),
+      globalPerMinute: readInteger(askRaw.globalPerMinute, DEFAULTS.ask.globalPerMinute, 1, 600),
+      defaultMode: askRaw.defaultMode === 'steer' ? 'steer' : 'queue',
+      narrow: readBoolean(askRaw.narrow, DEFAULTS.ask.narrow),
+      narrowTemplate: readText(askRaw.narrowTemplate, DEFAULTS.ask.narrowTemplate),
+      replyAllowanceTokens: readInteger(askRaw.replyAllowanceTokens, DEFAULTS.ask.replyAllowanceTokens, 0, 200000),
+    },
+    archive: {
+      maxScanEvents: readInteger(archiveRaw.maxScanEvents, DEFAULTS.archive.maxScanEvents, 1, 200000),
+      maxHits: readInteger(archiveRaw.maxHits, DEFAULTS.archive.maxHits, 1, 200),
+      maxBlockChars: readInteger(archiveRaw.maxBlockChars, DEFAULTS.archive.maxBlockChars, 200, 100000),
+      outlineMaxTurns: readInteger(archiveRaw.outlineMaxTurns, DEFAULTS.archive.outlineMaxTurns, 1, 500),
+      includeToolResults: readBoolean(archiveRaw.includeToolResults, DEFAULTS.archive.includeToolResults),
+      pageSize: readInteger(archiveRaw.pageSize, DEFAULTS.archive.pageSize, 1, 200),
+      maxPages: readInteger(archiveRaw.maxPages, DEFAULTS.archive.maxPages, 1, 50),
+      listLimit: readInteger(archiveRaw.listLimit, DEFAULTS.archive.listLimit, 1, 200),
+    },
   }
 }
 
 /* ------------------------------------------------------------------ *
  * 小工具
  * ------------------------------------------------------------------ */
-
-function newId() {
-  return randomUUID()
-}
 
 function render(template, vars) {
   return template.replace(/\{\{(\w+)\}\}/g, (match, key) =>
@@ -133,440 +121,245 @@ function textBlocks(text) {
   return [{ type: 'text', text }]
 }
 
-function clip(text, max) {
-  if (typeof text !== 'string') return ''
-  return text.length > max ? `${text.slice(0, max)}\n…（已截断，原文 ${text.length} 字）` : text
-}
-
-/** 把一条消息的 content 块拼成纯文本（只取 text 块，丢掉推理与工具调用）。 */
-function contentToText(content, max) {
-  if (!Array.isArray(content)) return ''
-  const parts = []
-  for (const block of content) {
-    if (block === null || typeof block !== 'object') continue
-    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-  }
-  return clip(parts.join('\n').trim(), max)
-}
-
-/** 这些调用都很快，不需要把工具超时信号透传下去；用一个永不中止的信号即可。 */
-function idleSignal() {
-  return new AbortController().signal
-}
-
-/**
- * `ctx.sessionController` 的 `@Remote` 方法（prompt / page / list / projections）
- * 在包装层会对第二个 signal 参数直接调用 `signal.throwIfAborted()`，
- * 所以**每一个**这类调用都必须显式传一个 AbortSignal，漏传会抛
- * `Cannot read properties of undefined (reading 'throwIfAborted')`。
- * 工具执行上下文里有信号就透传它（工具被中止时同步中止宿主调用），否则用兜底信号。
- */
-function signalOf(exec) {
-  return exec?.signal ?? idleSignal()
-}
-
-function titleOfSummary(row) {
-  const values = asRecord(asRecord(row).projections).values
-  const title = asRecord(values).title
-  return typeof title === 'string' ? title : ''
-}
-
-/* ------------------------------------------------------------------ *
- * 上下文占用
- * ------------------------------------------------------------------ */
-
-/**
- * 读取一个会话当前的上下文占用。
- *
- * 优先使用官方 `contextPressure` 投影（与聊天输入框上方的上下文环同源）：
- * 其 wire 视图的 `projectedTokens = max(0, pressureTokens + surfaceTokens - sampledSurfaceTokens)`
- * 就是「下一次请求」的占用估计。投影不可用时退回到 `ctx.tokenMeter.measure()`。
- */
-function readOccupancy(api, session) {
-  if (session === undefined || session === null) return undefined
-  let contextWindow
-  let tokens
-  try {
-    const pressure = api.sessionProjections?.stateOf(session, 'contextPressure')
-    if (pressure !== undefined && pressure !== null) {
-      if (typeof pressure.contextWindow === 'number') contextWindow = pressure.contextWindow
-      if (typeof pressure.pressureTokens === 'number') {
-        const surface = typeof pressure.surfaceTokens === 'number' ? pressure.surfaceTokens : 0
-        const sampled = typeof pressure.sampledSurfaceTokens === 'number' ? pressure.sampledSurfaceTokens : 0
-        tokens = Math.max(0, pressure.pressureTokens + surface - sampled)
-      }
-    }
-  } catch {
-    /* 投影未注册或会话未挂载：走下面的兜底 */
-  }
-  if (contextWindow === undefined) {
-    try {
-      contextWindow = session.requestContext?.()?.contextWindow
-    } catch {
-      /* request/context 还没落库 */
-    }
-  }
-  if (tokens === undefined) {
-    try {
-      tokens = api.tokenMeter?.measure(session)?.totalTokens
-    } catch {
-      /* 测量失败就当读不到 */
-    }
-  }
-  if (typeof contextWindow !== 'number' || contextWindow <= 0) return undefined
-  if (typeof tokens !== 'number' || !Number.isFinite(tokens)) return undefined
-  const ratio = tokens / contextWindow
-  return {
-    tokens: Math.max(0, Math.round(tokens)),
-    contextWindow: Math.round(contextWindow),
-    ratio,
-    percent: Math.round(ratio * 1000) / 10,
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * 工具定义（原始 ToolDefinition，不依赖 defineTool）
- * ------------------------------------------------------------------ */
-
 function tool(options) {
   return {
     name: options.name,
     description: options.description,
     parameters: options.parameters,
-    output: {
-      schema: options.output.schema,
-      render: options.output.render,
-    },
+    output: { schema: options.output.schema, render: options.output.render },
     async execute(args, exec) {
-      return options.execute(asRecord(args), exec)
+      return options.execute(isRecord(args) ? args : {}, exec)
     },
   }
 }
 
-const CONVERSATION_ROW = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    sessionId: { type: 'string' },
-    title: { type: 'string' },
-    cwd: { type: 'string' },
-    running: { type: 'boolean' },
-    blank: { type: 'boolean' },
-    origin: { type: 'string' },
-    parentSessionId: { type: 'string' },
-    updatedAt: { type: 'integer' },
-    current: { type: 'boolean' },
-  },
+/** 宽松输出 schema：给模型看字段，但不用 additionalProperties:false 把自己钉死。 */
+function looseSchema(properties) {
+  return { type: 'object', additionalProperties: true, properties }
 }
 
+const STRING = { type: 'string' }
+const INTEGER = { type: 'integer' }
+const BOOLEAN = { type: 'boolean' }
+const NUMBER = { type: 'number' }
+
+/* ------------------------------------------------------------------ *
+ * 护栏（§7）
+ * ------------------------------------------------------------------ */
+
+function createGuard(config) {
+  /** asker → target：谁依赖谁（用于环路与深度，不靠模型传参） */
+  const dependsOn = new Map()
+  const lastAskAt = new Map()
+  const recent = []
+
+  function depthOf(sessionId) {
+    let depth = 0
+    let cursor = dependsOn.get(sessionId)
+    const seen = new Set([sessionId])
+    while (cursor !== undefined && !seen.has(cursor)) {
+      depth += 1
+      seen.add(cursor)
+      cursor = dependsOn.get(cursor)
+    }
+    return depth
+  }
+
+  function reaches(from, goal) {
+    let cursor = from
+    const seen = new Set()
+    while (cursor !== undefined && !seen.has(cursor)) {
+      if (cursor === goal) return true
+      seen.add(cursor)
+      cursor = dependsOn.get(cursor)
+    }
+    return false
+  }
+
+  function check(askerId, targetId) {
+    if (askerId === '' || targetId === '') return { ok: false, reason: 'missing-id' }
+    if (askerId === targetId) return { ok: false, reason: 'self', message: '不能回问自己。' }
+    const depth = depthOf(askerId)
+    if (depth + 1 > config.ask.maxDepth) {
+      return {
+        ok: false,
+        reason: 'depth',
+        depth,
+        message: `已达回问深度上限（${config.ask.maxDepth} 跳）。请改为翻旧书（conversation_outline / conversation_search / conversation_read），或把该留下的写进交接件。`,
+      }
+    }
+    if (reaches(targetId, askerId)) {
+      return { ok: false, reason: 'cycle', message: '检测到回问环路（对方已经问过你这条链）。请改为翻旧书。' }
+    }
+    const pairKey = `${askerId}\u0000${targetId}`
+    const last = lastAskAt.get(pairKey) ?? 0
+    const waitMs = config.ask.pairCooldownMs - (Date.now() - last)
+    if (waitMs > 0) {
+      return {
+        ok: false,
+        reason: 'cooldown',
+        waitMs,
+        message: `刚问过这个对话，请等 ${Math.ceil(waitMs / 1000)} 秒再问；期间可以先翻旧书。`,
+      }
+    }
+    const now = Date.now()
+    while (recent.length > 0 && now - recent[0] > 60000) recent.shift()
+    if (recent.length >= config.ask.globalPerMinute) {
+      return { ok: false, reason: 'rate', message: `回问过于频繁（每分钟上限 ${config.ask.globalPerMinute} 次），请稍后。` }
+    }
+    return { ok: true, depth }
+  }
+
+  function record(askerId, targetId) {
+    dependsOn.set(askerId, targetId)
+    const now = Date.now()
+    lastAskAt.set(`${askerId}\u0000${targetId}`, now)
+    recent.push(now)
+  }
+
+  return { check, record, depthOf }
+}
+
+/* ------------------------------------------------------------------ *
+ * 工具
+ * ------------------------------------------------------------------ */
+
 function buildTools(api, config) {
-  function requireController() {
-    const controller = api.sessionController
-    if (controller === undefined) throw new Error('conversation-bridge: 当前部署没有 sessionController 服务，跨对话能力不可用')
-    return controller
+  const { host } = api
+
+  function requireHost() {
+    if (!host.available()) throw new Error(`${PLUGIN}: 当前部署没有 sessionController 服务，跨对话能力不可用`)
+  }
+
+  function selfSessionId(exec) {
+    const id = exec?.agent?.session?.id
+    return id === undefined ? '' : String(id)
+  }
+
+  /** 把"读一页/翻多页"统一成事件数组，并守住扫描预算。 */
+  async function scanSession(sessionId, exec, options = {}) {
+    const cursor = await host.resolveCursor(sessionId, signalOf(exec), options.cursorHint)
+    if (cursor === undefined) return { unreadable: true, events: [], cursor }
+    if (cursor < 0) return { empty: true, events: [], cursor }
+    const maxPages = options.maxPages ?? config.archive.maxPages
+    const result = await host.readPagesBackwards({
+      sessionId,
+      throughSeq: cursor,
+      maxMessages: config.archive.pageSize,
+      maxPages,
+    }, signalOf(exec))
+    const events = eventsOf(result.records)
+    const truncated = events.length > config.archive.maxScanEvents
+    return {
+      cursor,
+      events: truncated ? events.slice(events.length - config.archive.maxScanEvents) : events,
+      hasMore: result.hasMore === true,
+      truncated,
+    }
   }
 
   return [
-    /* ---------------- conversation_list ---------------- */
+    /* ---------------------------------------------------------------- *
+     * conversation_list
+     * ---------------------------------------------------------------- */
     tool({
       name: 'conversation_list',
       description:
-        '列出本机所有 DSH 对话（会话），按最近活动排序，用于找到要发消息 / 要追问的那个对话。'
-        + '每行给出 sessionId、标题、工作目录、是否运行中、是否空白、是否子 agent，以及是否就是当前对话。',
+        '列出本机所有 DSH 对话（会话），按最近活动排序，可按父会话展开一棵子 agent 子树。'
+        + '每行给出 sessionId、标题、工作目录、是否运行中/空白、origin、parentSessionId、在树里的深度。'
+        + '只读：不会唤醒任何对话。',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          limit: { type: 'integer', description: `最多返回多少行，默认 ${config.listLimit}` },
-          includeSubagents: { type: 'boolean', description: '是否包含子 agent 会话（默认 false）' },
+          limit: { type: 'integer', description: `最多返回多少行，默认 ${config.archive.listLimit}` },
+          parentSessionId: { type: 'string', description: '给了就只列它这棵子树（含全部后代）' },
+          rootsOnly: { type: 'boolean', description: '只列没有父会话的（默认 false）' },
+          includeSubagents: { type: 'boolean', description: '是否包含子 agent 会话（默认 true）' },
+          withOccupancy: { type: 'boolean', description: '是否附带上下文占用（每行一次只读读取，默认 false，最多算 10 行）' },
         },
       },
       output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            total: { type: 'integer' },
-            conversations: { type: 'array', items: CONVERSATION_ROW },
-          },
-        },
+        schema: looseSchema({
+          total: INTEGER,
+          conversations: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        }),
         render: (_args, value) => [{
           type: 'text',
           text: value.conversations.length === 0
             ? '没有找到对话。'
             : value.conversations.map((row) => [
-              `${row.current ? '▶ ' : '  '}${row.sessionId}`,
+              `${row.current ? '▶ ' : '  '}${'  '.repeat(Math.min(row.depth, 4))}${row.sessionId}`,
               row.title ? ` 标题=${row.title}` : '',
               row.cwd ? ` cwd=${row.cwd}` : '',
               row.running ? ' [运行中]' : '',
               row.blank ? ' [空白]' : '',
               row.origin === 'subagent' ? ' [子agent]' : '',
+              row.occupancyPercent === undefined ? '' : ` 占用=${row.occupancyPercent}%(${row.occupancySource})`,
             ].join('')).join('\n'),
         }],
       },
       async execute(args, exec) {
-        const controller = requireController()
-        const limit = readInteger(args.limit, config.listLimit, 1, 200)
-        const value = await controller.list({}, idleSignal())
-        const selfId = exec?.agent?.session?.id
-        const rows = []
-        for (const item of Array.isArray(value?.items) ? value.items : []) {
-          if (item === null || typeof item !== 'object') continue
-          if (!args.includeSubagents && item.origin === 'subagent') continue
-          rows.push({
-            sessionId: String(item.sessionId),
-            title: titleOfSummary(item),
-            cwd: typeof item.cwd === 'string' ? item.cwd : '',
-            running: item.running === true,
-            blank: item.blank === true,
-            origin: typeof item.origin === 'string' ? item.origin : 'session',
-            parentSessionId: item.parentSessionId === undefined ? '' : String(item.parentSessionId),
-            updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : 0,
-            current: selfId !== undefined && String(item.sessionId) === String(selfId),
+        requireHost()
+        const selfId = selfSessionId(exec)
+        const limit = readInteger(args.limit, config.archive.listLimit, 1, 200)
+        const summaries = await host.listSummaries(signalOf(exec))
+        const withTree = host.buildTree(summaries)
+
+        let rows = withTree
+        const parentId = typeof args.parentSessionId === 'string' ? args.parentSessionId.trim() : ''
+        if (parentId.length > 0) {
+          const subtree = collectSubtree(withTree, parentId)
+          if (subtree.length === 0) throw new Error(`${PLUGIN}: 找不到会话 ${parentId} 的子树`)
+          rows = subtree
+        } else {
+          if (args.rootsOnly === true) rows = rows.filter((row) => row.parentSessionId === '')
+          if (args.includeSubagents === false) rows = rows.filter((row) => row.origin !== 'subagent')
+        }
+        rows = [...rows].sort((left, right) => right.updatedAt - left.updatedAt)
+        const shown = rows.slice(0, limit)
+
+        let occupancyBudget = args.withOccupancy === true ? 10 : 0
+        const conversations = []
+        for (const row of shown) {
+          let occupancyPercent
+          let occupancySource
+          if (occupancyBudget > 0) {
+            occupancyBudget -= 1
+            const pressure = await host.readPressureById(row.sessionId, signalOf(exec))
+            if (pressure !== undefined) {
+              occupancyPercent = pressure.percent
+              occupancySource = pressure.source
+            }
+          }
+          conversations.push({
+            sessionId: row.sessionId,
+            title: row.title,
+            cwd: row.cwd,
+            origin: row.origin,
+            parentSessionId: row.parentSessionId,
+            depth: row.depth,
+            orphanParent: row.orphanParent,
+            running: row.running,
+            blank: row.blank,
+            agentAvailable: row.agentAvailable,
+            updatedAt: row.updatedAt,
+            current: selfId !== '' && row.sessionId === selfId,
+            ...(occupancyPercent === undefined ? {} : { occupancyPercent, occupancySource }),
           })
         }
-        rows.sort((left, right) => right.updatedAt - left.updatedAt || left.sessionId.localeCompare(right.sessionId))
-        return { total: rows.length, conversations: rows.slice(0, limit) }
+        return { total: rows.length, conversations }
       },
     }),
 
-    /* ---------------- conversation_start ---------------- */
-    tool({
-      name: 'conversation_start',
-      description:
-        '开启一个全新的 DSH 对话（会话），并可立刻把第一条消息（例如交接文档全文）发进去。'
-        + '新对话会出现在界面的对话列表里，并独立运行而不打断当前对话。'
-        + '交接时把交接文档全文作为 message 传入；插件会自动在新对话开场消息前加上「如何回问上一段对话」的说明。'
-        + '返回新对话的 sessionId 与工作目录。',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          message: { type: 'string', description: '新对话的第一条消息（交接时放交接文档全文）。省略则只创建空对话。' },
-          title: { type: 'string', description: '给新对话起的标题，便于之后在列表里找到它。' },
-          cwd: { type: 'string', description: '新对话的工作目录，默认继承当前对话的工作目录。' },
-          agentPreset: { type: 'string', description: '新对话使用的 agent preset，默认继承当前对话。' },
-        },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            sessionId: { type: 'string' },
-            cwd: { type: 'string' },
-            title: { type: 'string' },
-            parentSessionId: { type: 'string' },
-            messageSent: { type: 'boolean' },
-            note: { type: 'string' },
-          },
-        },
-        render: (_args, value) => [{
-          type: 'text',
-          text: `已开启新对话 sessionId=${value.sessionId}${value.cwd ? `（cwd=${value.cwd}）` : ''}。`
-            + `${value.messageSent ? '开场消息已发送。' : '尚未发送任何消息。'}`
-            + `${value.parentSessionId ? ` 上一段对话 sessionId=${value.parentSessionId}；新对话可用 conversation_send 回问本对话。` : ''}`,
-        }],
-      },
-      async execute(args, exec) {
-        const controller = requireController()
-        const session = exec?.agent?.session
-        const parentSessionId = session?.id === undefined ? '' : String(session.id)
-        const parentCwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
-        const parentPreset = typeof session?.header?.agentPreset === 'string' ? session.header.agentPreset : ''
-
-        const requestedCwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : ''
-        const cwd = requestedCwd || (config.inheritCwd ? parentCwd : '')
-        const requestedPreset = typeof args.agentPreset === 'string' && args.agentPreset.trim().length > 0
-          ? args.agentPreset.trim()
-          : ''
-        const agentPreset = requestedPreset || (config.inheritPreset ? parentPreset : '')
-
-        const request = {}
-        if (cwd) request.cwd = cwd
-        if (agentPreset) request.agentPreset = agentPreset
-        const created = await controller.create(request)
-        const sessionId = String(created.sessionId)
-
-        const title = typeof args.title === 'string' && args.title.trim().length > 0 ? args.title.trim() : ''
-        if (title) {
-          try {
-            await controller.rename({ sessionId, title })
-          } catch (error) {
-            ctxWarn(api, `新对话改名失败: ${String(error)}`)
-          }
-        }
-
-        let messageSent = false
-        const body = typeof args.message === 'string' ? args.message.trim() : ''
-        if (body.length > 0) {
-          const occupancy = readOccupancy(api, session)
-          const header = config.handoffHeader && parentSessionId
-            ? `${render(config.handoffHeaderText, {
-              parentSessionId,
-              parentTitle: title || '（未命名）',
-              parentCwd: parentCwd || '（未设置）',
-              percent: occupancy === undefined ? '未知' : occupancy.percent,
-              sessionId,
-              cwd: cwd || '（未设置）',
-            })}\n\n---\n\n`
-            : ''
-          await controller.prompt({
-            requestId: newId(),
-            sessionId,
-            mode: 'queue',
-            content: textBlocks(`${header}${body}`),
-          }, signalOf(exec))
-          messageSent = true
-        }
-
-        if (parentSessionId) api.markHandedOff(parentSessionId)
-
-        return {
-          sessionId,
-          cwd: cwd || '',
-          title,
-          parentSessionId,
-          messageSent,
-          note: '新对话已创建；需要它回答时给它发消息，它有问题时可用 conversation_send 回问本对话。',
-        }
-      },
-    }),
-
-    /* ---------------- conversation_send ---------------- */
-    tool({
-      name: 'conversation_send',
-      description:
-        '向另一个已存在的 DSH 对话发送一条消息；目标对话若处于冷态会被自动恢复并运行。'
-        + 'mode=queue（默认）把消息排到目标对话的下一轮；mode=steer 插到它当前回合的下一步。'
-        + '投递是异步的，对方回复不会立刻返回，请稍后用 conversation_read 读取。',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['sessionId', 'message'],
-        properties: {
-          sessionId: { type: 'string', description: '目标对话的 sessionId（可用 conversation_list 查）' },
-          message: { type: 'string', description: '要发送的消息正文' },
-          mode: { type: 'string', enum: ['queue', 'steer'], description: 'queue=排到下一轮（默认）；steer=插到当前回合下一步' },
-        },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            sessionId: { type: 'string' },
-            mode: { type: 'string' },
-            accepted: { type: 'boolean' },
-            note: { type: 'string' },
-          },
-        },
-        render: (_args, value) => [{
-          type: 'text',
-          text: `消息已投递给对话 ${value.sessionId}（mode=${value.mode}）。对方处理完后可用 conversation_read 读取其最新回复。`,
-        }],
-      },
-      async execute(args, exec) {
-        const controller = requireController()
-        const sessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
-        const message = typeof args.message === 'string' ? args.message.trim() : ''
-        if (sessionId.length === 0) throw new Error('conversation_send: sessionId 不能为空')
-        if (message.length === 0) throw new Error('conversation_send: message 不能为空')
-        const mode = args.mode === 'steer' ? 'steer' : 'queue'
-        await controller.prompt({ requestId: newId(), sessionId, mode, content: textBlocks(message) }, signalOf(exec))
-        return {
-          sessionId,
-          mode,
-          accepted: true,
-          note: '已投递。回复是异步产生的，请稍后用 conversation_read 读取。',
-        }
-      },
-    }),
-
-    /* ---------------- conversation_read ---------------- */
-    tool({
-      name: 'conversation_read',
-      description:
-        '读取另一个 DSH 对话最新的若干条消息（只读，不唤醒、不打断目标对话）。'
-        + '用于回问上一段对话后取回它的答复。',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['sessionId'],
-        properties: {
-          sessionId: { type: 'string', description: '要读取的对话 sessionId' },
-          limit: { type: 'integer', description: `最多读取多少条消息，默认 ${config.readLimit}` },
-        },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            sessionId: { type: 'string' },
-            title: { type: 'string' },
-            hasMore: { type: 'boolean' },
-            messages: {
-              type: 'array',
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  role: { type: 'string' },
-                  text: { type: 'string' },
-                },
-              },
-            },
-          },
-        },
-        render: (_args, value) => [{
-          type: 'text',
-          text: value.messages.length === 0
-            ? `对话 ${value.sessionId} 还没有可读消息。`
-            : `对话 ${value.sessionId}${value.title ? `（${value.title}）` : ''} 最近 ${value.messages.length} 条消息：\n\n`
-              + value.messages.map((message) => `[${message.role}] ${message.text}`).join('\n\n'),
-        }],
-      },
-      async execute(args) {
-        const controller = requireController()
-        const sessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
-        if (sessionId.length === 0) throw new Error('conversation_read: sessionId 不能为空')
-        const limit = readInteger(args.limit, config.readLimit, 1, 200)
-        const page = await controller.page({
-          address: { kind: 'session', sessionId },
-          throughSeq: -1,
-          maxMessages: limit,
-        }, idleSignal())
-        const messages = []
-        for (const record of Array.isArray(page?.records) ? page.records : []) {
-          const event = record?.event
-          if (event === null || typeof event !== 'object') continue
-          if (event.type === 'user/message') {
-            const text = contentToText(event.data?.content, config.maxMessageChars)
-            if (text.length > 0) messages.push({ role: 'user', text })
-          } else if (event.type === 'assistant/message') {
-            const text = contentToText(event.data?.message?.content, config.maxMessageChars)
-            if (text.length > 0) messages.push({ role: 'assistant', text })
-          }
-        }
-        let title = ''
-        try {
-          const baseline = await controller.projections({ sessionId }, idleSignal())
-          const value = asRecord(asRecord(baseline).values).title
-          if (typeof value === 'string') title = value
-        } catch {
-          /* 标题只是锦上添花 */
-        }
-        return { sessionId, title, hasMore: page?.hasMore === true, messages }
-      },
-    }),
-
-    /* ---------------- conversation_context ---------------- */
+    /* ---------------------------------------------------------------- *
+     * conversation_context
+     * ---------------------------------------------------------------- */
     tool({
       name: 'conversation_context',
       description:
-        '读取一个对话的上下文占用（token 数、上下文窗口、百分比、是否已超过接力阈值），默认当前对话。'
-        + '用于确认是否需要写交接文档、以及交接后确认占用是否已经下降。',
+        '读取一个对话的上下文占用（token / 窗口 / 百分比）与它的历史压缩点，默认当前对话。'
+        + '只读：不会唤醒对方。占用来源会标注 live 还是 cached（缓存可能偏旧）。',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -575,72 +368,529 @@ function buildTools(api, config) {
         },
       },
       output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            sessionId: { type: 'string' },
-            available: { type: 'boolean' },
-            tokens: { type: 'integer' },
-            contextWindow: { type: 'integer' },
-            percent: { type: 'number' },
-            thresholdPercent: { type: 'number' },
-            overThreshold: { type: 'boolean' },
-          },
-        },
+        schema: looseSchema({
+          sessionId: STRING,
+          available: BOOLEAN,
+          tokens: INTEGER,
+          contextWindow: INTEGER,
+          percent: NUMBER,
+          source: STRING,
+          compactionPoints: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        }),
         render: (_args, value) => [{
           type: 'text',
-          text: value.available
-            ? `上下文占用：${value.percent}%（约 ${value.tokens} / ${value.contextWindow} tokens，接力阈值 ${value.thresholdPercent}%）${value.overThreshold ? ' —— 已超过阈值，请写交接文档并开启新对话。' : ''}`
-            : '读不到该对话的上下文占用（可能还没有发起过模型请求）。',
+          text: !value.available
+            ? `读不到 ${value.sessionId} 的上下文占用（可能还没发起过模型请求）。`
+            : `对话 ${value.sessionId} 上下文占用：${value.percent}%（约 ${value.tokens} / ${value.contextWindow} tokens，来源 ${value.source}）；`
+              + `历史压缩点 ${value.compactionPoints.length} 个。`,
         }],
       },
       async execute(args, exec) {
+        requireHost()
         const requested = typeof args.sessionId === 'string' && args.sessionId.trim().length > 0
           ? args.sessionId.trim()
-          : ''
-        let session = exec?.agent?.session
-        if (requested.length > 0 && String(session?.id) !== requested) {
-          const controller = requireController()
-          const resolution = await controller.resolveAgent(requested)
-          const resolved = resolution?.agent ?? (resolution?.id === undefined ? undefined : resolution)
-          if (resolved?.session !== undefined) session = resolved.session
-          else if (resolution?.error !== undefined) throw resolution.error
-          else throw new Error(`conversation_context: 找不到对话 ${requested}`)
+          : selfSessionId(exec)
+        if (requested === '') throw new Error(`${PLUGIN}: 没有可用的 sessionId`)
+        const pressure = await host.readPressureById(requested, signalOf(exec))
+        const scan = await scanSession(requested, exec, { maxPages: 3 })
+        const points = collectCompactionPoints(scan.events, { headChars: 120 })
+        return {
+          sessionId: requested,
+          available: pressure !== undefined,
+          tokens: pressure?.tokens ?? 0,
+          contextWindow: pressure?.contextWindow ?? 0,
+          percent: pressure?.percent ?? 0,
+          source: pressure?.source ?? 'unknown',
+          compactionPoints: points.map(toPointView),
         }
-        const thresholdPercent = Math.round(config.threshold * 1000) / 10
-        const occupancy = readOccupancy(api, session)
-        if (occupancy === undefined) {
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_outline（Tier-0 旧书目录）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_outline',
+      description:
+        '给一个对话的"旧书目录"：按轮次一行（轮号、时间、用户首行、是否有工具调用/失败、是否被压缩点覆盖）。'
+        + '翻旧书的第一步，先看目录再决定下探哪里。只读。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sessionId'],
+        properties: {
+          sessionId: { type: 'string', description: '要看的对话 sessionId' },
+          maxTurns: { type: 'integer', description: `最多给多少轮（取最新的），默认 ${config.archive.outlineMaxTurns}` },
+          maxPages: { type: 'integer', description: `最多向后翻几页，默认 ${config.archive.maxPages}` },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          sessionId: STRING,
+          totalTurns: INTEGER,
+          truncated: BOOLEAN,
+          turns: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          compactionPoints: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.turns.length === 0
+            ? `对话 ${value.sessionId} 没有可读的轮次。`
+            : `对话 ${value.sessionId} 共 ${value.totalTurns} 轮${value.truncated ? '（只显示最新一段）' : ''}：\n`
+              + value.turns.map((turn) => [
+                `#${turn.turn} seq=${turn.startSeq}..${turn.endSeq}`,
+                turn.userHead ? ` ${turn.userHead}` : '',
+                turn.hasToolCalls ? ' [有工具]' : '',
+                turn.toolFailures > 0 ? ` [工具失败×${turn.toolFailures}]` : '',
+                turn.compacted ? ' [含压缩点]' : '',
+              ].join('')).join('\n'),
+        }],
+      },
+      async execute(args, exec) {
+        requireHost()
+        const sessionId = readText(args.sessionId, '')
+        if (sessionId === '') throw new Error(`${PLUGIN}: conversation_outline 需要 sessionId`)
+        const scan = await scanSession(sessionId, exec, { maxPages: args.maxPages })
+        if (scan.unreadable === true) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
+        const outline = buildOutline(scan.events, {
+          maxTurns: readInteger(args.maxTurns, config.archive.outlineMaxTurns, 1, 500),
+          headChars: 80,
+        })
+        return {
+          sessionId,
+          totalTurns: outline.totalTurns,
+          truncated: outline.truncated || scan.truncated === true,
+          turns: outline.turns,
+          compactionPoints: outline.compactionPoints.map(toPointView),
+        }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_search（Tier-1 旧书检索）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_search',
+      description:
+        '在一个对话的持久日志里做只读检索（关键词之间是"与"关系，忽略大小写），'
+        + '命中被压缩掉的内容也能搜到。返回命中片段与位置（seq），不返回全文，'
+        + '拿到 seq 再用 conversation_read 的 atSeq 取原文块。只读。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sessionId', 'query'],
+        properties: {
+          sessionId: { type: 'string', description: '要检索的对话 sessionId' },
+          query: { type: 'string', description: '关键词，空格分隔表示"都要命中"' },
+          roles: {
+            type: 'array',
+            items: { type: 'string', enum: ['user', 'assistant', 'tool', 'developer'] },
+            description: '只在哪些角色里搜，默认 user + assistant + tool',
+          },
+          limit: { type: 'integer', description: `最多返回多少条命中，默认 ${config.archive.maxHits}` },
+          maxPages: { type: 'integer', description: `最多向后翻几页，默认 ${config.archive.maxPages}` },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          sessionId: STRING,
+          scanned: INTEGER,
+          truncated: BOOLEAN,
+          hits: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.hits.length === 0
+            ? `对话 ${value.sessionId} 里没有命中（扫描 ${value.scanned} 条消息${value.truncated ? '，且已达到扫描上限' : ''}）。`
+            : `对话 ${value.sessionId} 命中 ${value.hits.length} 条：\n\n`
+              + value.hits.map((hit) => `[seq=${hit.seq} ${hit.role}] ${hit.snippet}`).join('\n\n'),
+        }],
+      },
+      async execute(args, exec) {
+        requireHost()
+        const sessionId = readText(args.sessionId, '')
+        const query = readText(args.query, '')
+        if (sessionId === '') throw new Error(`${PLUGIN}: conversation_search 需要 sessionId`)
+        if (query === '') throw new Error(`${PLUGIN}: conversation_search 需要 query`)
+        const scan = await scanSession(sessionId, exec, { maxPages: args.maxPages })
+        if (scan.unreadable === true) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
+        const roles = Array.isArray(args.roles) && args.roles.length > 0
+          ? args.roles.filter((role) => typeof role === 'string')
+          : ['user', 'assistant', 'tool']
+        const result = searchEvents(scan.events, query, {
+          sessionId,
+          roles,
+          limit: readInteger(args.limit, config.archive.maxHits, 1, 200),
+          maxChars: config.archive.maxBlockChars,
+        })
+        return {
+          sessionId,
+          scanned: result.scanned,
+          truncated: scan.truncated === true || scan.hasMore === true,
+          hits: result.hits,
+        }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_read
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_read',
+      description:
+        '读一个对话的消息。三种用法：'
+        + '① 只给 sessionId → 读最新一页；'
+        + '② 给 askId（来自 conversation_ask）→ 读那一次回问的答复，并附带可信度 trust；'
+        + '③ 给 atSeq → 取该位置的原文块（配合 conversation_search 的命中位置下探）。'
+        + '全程只读，不会唤醒对方。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sessionId'],
+        properties: {
+          sessionId: { type: 'string', description: '要读的对话 sessionId' },
+          askId: { type: 'string', description: 'conversation_ask 返回的 askId：读这一次回问的答复并判定可信度' },
+          atSeq: { type: 'integer', description: '取该 seq 的原文块' },
+          limit: { type: 'integer', description: `最多读多少条消息，默认 ${config.archive.pageSize}` },
+          includeTools: { type: 'boolean', description: '是否包含工具结果（默认 true；压缩最容易丢的就是它）' },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          sessionId: STRING,
+          messages: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          trust: STRING,
+          answered: BOOLEAN,
+          reason: STRING,
+          compactionPoints: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          occupancyAfter: { type: 'object', additionalProperties: true },
+          block: { type: 'object', additionalProperties: true },
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: renderReadResult(value),
+        }],
+      },
+      async execute(args, exec) {
+        requireHost()
+        const sessionId = readText(args.sessionId, '')
+        if (sessionId === '') throw new Error(`${PLUGIN}: conversation_read 需要 sessionId`)
+        const maxChars = config.archive.maxBlockChars
+        const includeTools = args.includeTools !== false && config.archive.includeToolResults
+        const roles = includeTools ? ['user', 'assistant', 'tool'] : ['user', 'assistant']
+
+        // ③ 取原文块
+        if (Number.isSafeInteger(args.atSeq)) {
+          const page = await host.readPage({
+            sessionId,
+            throughSeq: args.atSeq,
+            maxMessages: 1,
+          }, signalOf(exec))
+          const events = eventsOf(page.records)
+          const messages = extractMessages(events, { roles, maxChars })
+          const block = messages.find((message) => message.seq === args.atSeq)
+            ?? messages[messages.length - 1]
+          if (block === undefined) throw new Error(`${PLUGIN}: seq=${args.atSeq} 处没有可读消息`)
+          return { sessionId, block, messages: [block] }
+        }
+
+        // ①② 读最新一页 / 读某次回问的答复
+        const cursor = await host.resolveCursor(sessionId, signalOf(exec))
+        if (cursor === undefined) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
+        if (cursor < 0) {
+          return { sessionId, messages: [], trust: 'unknown', answered: false, reason: 'empty-session', compactionPoints: [] }
+        }
+        const pages = await host.readPagesBackwards({
+          sessionId,
+          throughSeq: cursor,
+          maxMessages: readInteger(args.limit, config.archive.pageSize, 1, 200),
+          maxPages: args.askId === undefined ? 1 : config.archive.maxPages,
+        }, signalOf(exec))
+        const events = eventsOf(pages.records)
+        const messages = extractMessages(events, { roles, maxChars }).slice(-readInteger(args.limit, config.archive.pageSize, 1, 200))
+        const occupancyAfter = await host.readPressureById(sessionId, signalOf(exec))
+
+        if (args.askId === undefined) {
           return {
-            sessionId: session?.id === undefined ? '' : String(session.id),
-            available: false,
-            tokens: 0,
-            contextWindow: 0,
-            percent: 0,
-            thresholdPercent,
-            overThreshold: false,
+            sessionId,
+            messages,
+            trust: 'unknown',
+            answered: false,
+            reason: 'no-ask-id',
+            compactionPoints: collectCompactionPoints(events, { headChars: 120 }).map(toPointView),
+            ...(occupancyAfter === undefined ? {} : { occupancyAfter }),
           }
         }
+        const verdict = assessTrust(events, String(args.askId))
         return {
-          sessionId: String(session.id),
-          available: true,
-          tokens: occupancy.tokens,
-          contextWindow: occupancy.contextWindow,
-          percent: occupancy.percent,
-          thresholdPercent,
-          overThreshold: occupancy.ratio >= config.threshold,
+          sessionId,
+          messages,
+          trust: verdict.trust,
+          answered: verdict.answered,
+          reason: verdict.reason,
+          questionSeq: verdict.questionSeq,
+          replySeq: verdict.replySeq,
+          compactionPoints: verdict.points.map(toPointView),
+          ...(occupancyAfter === undefined ? {} : { occupancyAfter }),
+        }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_ask（回问，首选）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_ask',
+      description:
+        '向另一个对话回问一个问题（会唤醒它、让它多走一轮）。这是首选取数方式：'
+        + '它现在综合后的结论 + 它还能顺手调度自己名下的子 agent。'
+        + '返回里带 askId 与事前读数（对方占用、预计越线风险）。'
+        + '拿到答复后用 conversation_read 传 askId 读取，并看 trust：trust 不是 clean 时请改用翻旧书比对。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sessionId', 'question'],
+        properties: {
+          sessionId: { type: 'string', description: '要问的对话 sessionId' },
+          question: { type: 'string', description: '要问的问题' },
+          mode: { type: 'string', enum: ['queue', 'steer'], description: 'queue=排到下一轮（默认）；steer=插到当前回合下一步' },
+          narrow: { type: 'boolean', description: '是否包成窄指令（默认 true：只回答、不复盘、不重做）' },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          sessionId: STRING,
+          accepted: BOOLEAN,
+          mode: STRING,
+          askId: STRING,
+          askDepth: INTEGER,
+          narrowed: BOOLEAN,
+          compactionRisk: STRING,
+          occupancyBefore: { type: 'object', additionalProperties: true },
+          projectedAfterPercent: NUMBER,
+          hint: STRING,
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: `已向对话 ${value.sessionId} 回问（mode=${value.mode}，askId=${value.askId}${value.narrowed ? '，窄指令' : ''}）。\n`
+            + `对方占用${value.occupancyBefore?.percent === undefined ? '未知' : ` ${value.occupancyBefore.percent}%`}`
+            + `（来源 ${value.occupancyBefore?.source ?? 'unknown'}），本轮压缩风险：${value.compactionRisk}。\n`
+            + `${value.compactionRisk === 'likely' ? '⚠️ 这一问很可能把它推过压缩线，答复可能失真——拿到后用 conversation_read 的 trust 判断，必要时翻旧书比对。\n' : ''}`
+            + `稍后用 conversation_read（sessionId=${value.sessionId}，askId=${value.askId}）读取答复与可信度。`,
+        }],
+      },
+      async execute(args, exec) {
+        requireHost()
+        const sessionId = readText(args.sessionId, '')
+        const question = readText(args.question, '')
+        if (sessionId === '') throw new Error(`${PLUGIN}: conversation_ask 需要 sessionId`)
+        if (question === '') throw new Error(`${PLUGIN}: conversation_ask 需要 question`)
+
+        const askerId = selfSessionId(exec)
+        const verdict = api.guard.check(askerId, sessionId)
+        if (!verdict.ok) throw new Error(`${PLUGIN}: ${verdict.message}`)
+
+        const occupancyBefore = await host.readPressureById(sessionId, signalOf(exec))
+        const narrowed = args.narrow !== false && config.ask.narrow
+        const body = narrowed ? render(config.ask.narrowTemplate, { question }) : question
+        const mode = args.mode === 'steer' ? 'steer' : (args.mode === 'queue' ? 'queue' : config.ask.defaultMode)
+        const askId = randomUUID()
+
+        await api.sessionController.prompt({
+          requestId: askId,
+          sessionId,
+          mode,
+          content: textBlocks(body),
+        }, signalOf(exec))
+
+        api.guard.record(askerId, sessionId)
+
+        const estimate = Math.ceil(body.length / 3) + config.ask.replyAllowanceTokens
+        const projected = occupancyBefore === undefined
+          ? undefined
+          : Math.round(((occupancyBefore.tokens + estimate) / occupancyBefore.contextWindow) * 1000) / 10
+        const compactionRisk = occupancyBefore === undefined || projected === undefined
+          ? 'unknown'
+          : (projected >= 80 ? 'likely' : 'low')
+
+        return {
+          sessionId,
+          accepted: true,
+          mode,
+          askId,
+          askDepth: verdict.depth + 1,
+          narrowed,
+          compactionRisk,
+          ...(occupancyBefore === undefined ? {} : { occupancyBefore }),
+          ...(projected === undefined ? {} : { projectedAfterPercent: projected }),
+          hint: compactionRisk === 'likely'
+            ? '这一问很可能触发压缩，答复可能基于摘要；拿到后请核对 trust，必要时翻旧书。'
+            : '答复是异步的，稍后用 conversation_read 传 askId 读取。',
+        }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_start（唯一开窗入口，不自动开）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_start',
+      description:
+        '开启一个全新的 DSH 对话并可选地把第一条消息发进去（交接时把交接件全文放进来）。'
+        + '新对话会出现在对话列表里并独立运行；开场消息自动带上"上一段对话是谁、怎么回问、怎么翻旧书"。'
+        + '阈值提醒只负责提醒，开窗由你或用户决定。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          message: { type: 'string', description: '新对话的第一条消息（交接时放交接件全文）' },
+          title: { type: 'string', description: '给新对话起的标题' },
+          cwd: { type: 'string', description: '新对话的工作目录，默认继承当前对话' },
+          agentPreset: { type: 'string', description: '新对话使用的 agent preset，默认继承当前对话' },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          sessionId: STRING,
+          cwd: STRING,
+          title: STRING,
+          parentSessionId: STRING,
+          messageSent: BOOLEAN,
+          note: STRING,
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: `已开启新对话 sessionId=${value.sessionId}${value.cwd ? `（cwd=${value.cwd}）` : ''}。`
+            + `${value.messageSent ? '开场消息已发送。' : '尚未发送任何消息。'}`
+            + `${value.parentSessionId ? ` 它可以用 conversation_ask(sessionId=${value.parentSessionId}) 回问本对话。` : ''}`,
+        }],
+      },
+      async execute(args, exec) {
+        requireHost()
+        const session = exec?.agent?.session
+        const parentSessionId = session?.id === undefined ? '' : String(session.id)
+        const parentCwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
+        const parentPreset = typeof session?.header?.agentPreset === 'string' ? session.header.agentPreset : ''
+
+        const requestedCwd = readText(args.cwd, '')
+        const cwd = requestedCwd !== '' ? requestedCwd : parentCwd
+        const requestedPreset = readText(args.agentPreset, '')
+        const agentPreset = requestedPreset !== '' ? requestedPreset : parentPreset
+
+        const request = {}
+        if (cwd !== '') request.cwd = cwd
+        if (agentPreset !== '') request.agentPreset = agentPreset
+        const created = await api.sessionController.create(request)
+        const sessionId = String(created.sessionId)
+
+        const title = readText(args.title, '')
+        if (title !== '') {
+          try {
+            await api.sessionController.rename({ sessionId, title })
+          } catch (error) {
+            api.warn(`新对话改名失败: ${String(error)}`)
+          }
+        }
+
+        let messageSent = false
+        const body = readText(args.message, '')
+        if (body !== '') {
+          const header = parentSessionId === '' ? '' : renderHandoffHeader({
+            parentSessionId,
+            parentTitle: title,
+            parentCwd,
+          })
+          await api.sessionController.prompt({
+            requestId: randomUUID(),
+            sessionId,
+            mode: 'queue',
+            content: textBlocks(`${header}${body}`),
+          }, signalOf(exec))
+          messageSent = true
+        }
+
+        return {
+          sessionId,
+          cwd,
+          title,
+          parentSessionId,
+          messageSent,
+          note: '需要它回答就给它发消息；它有问题时可用 conversation_ask 回问本对话，或用 conversation_outline/search/read 翻本对话的日志。',
         }
       },
     }),
   ]
 }
 
-function ctxWarn(api, message) {
-  try {
-    api.logger?.warn?.(`${PLUGIN}: ${message}`)
-  } catch {
-    /* 日志失败不影响功能 */
+/* ------------------------------------------------------------------ *
+ * 纯函数小件
+ * ------------------------------------------------------------------ */
+
+function collectSubtree(rows, rootId) {
+  const children = new Map()
+  for (const row of rows) {
+    const key = row.parentSessionId
+    if (!children.has(key)) children.set(key, [])
+    children.get(key).push(row)
   }
+  const root = rows.find((row) => row.sessionId === rootId)
+  if (root === undefined) return []
+  const out = []
+  const stack = [{ row: root, depth: 0 }]
+  const seen = new Set()
+  while (stack.length > 0) {
+    const { row, depth } = stack.pop()
+    if (seen.has(row.sessionId)) continue
+    seen.add(row.sessionId)
+    out.push({ ...row, depth })
+    for (const child of children.get(row.sessionId) ?? []) stack.push({ row: child, depth: depth + 1 })
+  }
+  return out
+}
+
+function toPointView(point) {
+  return {
+    seq: pointSeq(point),
+    summarySeq: point.summarySeq,
+    checkpointSeq: point.checkpointSeq,
+    startSeq: point.startSeq,
+    endSeq: point.endSeq,
+    time: point.time,
+    tokenCount: point.tokenCount,
+    head: point.head,
+  }
+}
+
+function renderHandoffHeader(vars) {
+  return `[接力对话] 这是一段由交接产生的新对话，接替上一段对话。
+- 上一段对话 sessionId = \`${vars.parentSessionId}\`${vars.parentTitle ? `（标题：${vars.parentTitle}）` : ''}${vars.parentCwd ? `，工作目录：${vars.parentCwd}` : ''}
+- **首选**：向它回问 —— \`conversation_ask\`（sessionId=\`${vars.parentSessionId}\`，question=你的问题），
+  然后 \`conversation_read\`（sessionId + askId）读答复；**看 trust**：
+  - \`clean\` → 直接用；
+  - \`compacted_by_ask\` / \`compacted_earlier\` / \`unknown\` → 结果可能失真，去翻它的原文比对。
+- **回退**：翻旧书（只读、不加压）—— \`conversation_outline\` 看目录 →
+  \`conversation_search\` 找位置 → \`conversation_read\`（atSeq）取原文块。
+- 交接件正文在下面的消息里；真相以工作区文件与日志为准，不要只信摘要。
+
+---
+
+`
+}
+
+function renderReadResult(value) {
+  if (value.block !== undefined) {
+    return `[seq=${value.block.seq} ${value.block.role}/${value.block.kind}]\n${value.block.text}`
+  }
+  const head = value.trust === undefined || value.trust === 'unknown'
+    ? ''
+    : (value.trust === 'clean'
+      ? '可信度：clean —— 答复基于真实表面，可直接使用。\n'
+      : `可信度：${value.trust}（${value.reason ?? ''}）—— 答复可能失真，建议翻旧书比对原文。\n`)
+  const body = value.messages.length === 0
+    ? '（没有可读消息）'
+    : value.messages.map((message) =>
+      `[seq=${message.seq} ${message.role}/${message.kind}] ${message.text}`).join('\n\n')
+  return `${head}${body}`
 }
 
 /* ------------------------------------------------------------------ *
@@ -653,118 +903,40 @@ function ctxWarn(api, message) {
  */
 export function apply(ctx, input = {}) {
   const config = resolveConfig(input)
-
-  /* ---- 每会话提醒状态（键为 sessionId 字符串） ---- */
-  const states = new Map()
-
-  function stateFor(sessionId) {
-    const key = String(sessionId)
-    let state = states.get(key)
-    if (state === undefined) {
-      state = { armed: true, lastRemindedAt: 0, handedOffAt: 0 }
-      states.set(key, state)
-    }
-    return state
-  }
+  const host = createHost(ctx)
+  const guard = createGuard(config)
 
   const api = {
+    host,
+    guard,
+    config,
     get sessionController() {
       return ctx.get('sessionController')
     },
-    get sessionProjections() {
-      return ctx.get('sessionProjections')
-    },
-    get tokenMeter() {
-      return ctx.get('tokenMeter')
-    },
-    get logger() {
-      return ctx.logger
-    },
-    /** conversation_start 成功后，本对话在该时长内不再被提醒。 */
-    markHandedOff(sessionId) {
-      const state = stateFor(sessionId)
-      state.handedOffAt = Date.now()
-      state.armed = false
-    },
-  }
-
-  /* ---- 工具 ---- */
-  if (config.exposeTools) {
-    if (api.sessionController === undefined) {
-      ctxWarn(api, '当前部署没有 sessionController 服务，跨对话工具未注册')
-    } else {
-      for (const definition of buildTools(api, config)) ctx.tools.register(definition)
-    }
-  }
-
-  /* ---- 上下文接力提醒 ---- */
-  if (config.enabled) {
-    // 每个模型步骤都会提交 assistant/message（有正文）或 assistant/attempt（只有工具调用）；
-    // request/context 只在路由/窗口变化时写；tool/result 会长大上下文表面。四类合起来
-    // 足以在回合进行中就把"越过阈值"这件事看见，turn/end 再兜一次底。
-    const watched = new Set(['assistant/message', 'assistant/attempt', 'request/context', 'tool/result', 'turn/end'])
-
-    const evaluate = (session, reason) => {
-      if (session === undefined || session === null) return
-      if (config.skipSubagents && session.header?.origin === 'subagent') return
-      const occupancy = readOccupancy(api, session)
-      if (occupancy === undefined) return
-      const state = stateFor(session.id)
-      if (occupancy.ratio <= config.rearmBelow) {
-        // 压缩或新对话让占用回落：重新武装，但保留 handedOffAt，
-        // 于是刚交接完的对话在 handoffQuietMs 内也不会被再次打扰。
-        state.armed = true
-      }
-      if (occupancy.ratio < config.threshold || !state.armed) return
-      const now = Date.now()
-      if (now - state.lastRemindedAt < config.cooldownMs) return
-      if (now - state.handedOffAt < config.handoffQuietMs) return
-      const agents = ctx.get('agents')
-      const agent = agents?.get(session.id)
-      if (agent === undefined) return
-      const controller = api.sessionController
-      if (controller === undefined) return
-
-      state.armed = false
-      state.lastRemindedAt = now
-      const text = render(config.reminderText, {
-        percent: occupancy.percent,
-        tokens: occupancy.tokens,
-        window: occupancy.contextWindow,
-        threshold: Math.round(config.threshold * 1000) / 10,
-        sessionId: String(session.id),
-        cwd: typeof session.header?.cwd === 'string' ? session.header.cwd : '（未设置）',
-        reason,
-      })
-      queueMicrotask(() => {
-        controller.prompt({
-          requestId: newId(),
-          sessionId: session.id,
-          mode: config.deliver,
-          content: textBlocks(text),
-        }, idleSignal()).then(
-          () => ctx.logger?.info?.(`${PLUGIN}: 已向 ${String(session.id)} 注入上下文接力提醒（${occupancy.percent}%）`),
-          (error) => ctxWarn(api, `向 ${String(session.id)} 注入提醒失败: ${String(error)}`),
-        )
-      })
-    }
-
-    ctx.on('session/event', (session, event) => {
-      if (!watched.has(event?.type)) return
+    warn(message) {
       try {
-        evaluate(session, event.type)
-      } catch (error) {
-        ctxWarn(api, `上下文占用检查失败: ${String(error)}`)
+        ctx.logger?.warn?.(`${PLUGIN}: ${message}`)
+      } catch {
+        /* 日志失败不影响功能 */
       }
-    })
-
-    ctx.on('session/disposed', (session) => {
-      states.delete(String(session?.id))
-    })
+    },
   }
 
-  ctx.logger?.info?.(
-    `${PLUGIN}: 已启用（工具=${config.exposeTools ? '开' : '关'}，`
-    + `接力提醒=${config.enabled ? `${Math.round(config.threshold * 100)}%` : '关'}，deliver=${config.deliver}）`,
-  )
+  if (!config.exposeTools) {
+    ctx.logger?.info?.(`${PLUGIN}: exposeTools=false，未注册任何工具`)
+    return
+  }
+  if (!host.available()) {
+    api.warn('当前部署没有 sessionController 服务，跨对话工具未注册（插件仍正常加载）')
+    return
+  }
+
+  for (const definition of buildTools(api, config)) ctx.tools.register(definition)
+
+  ctx.logger?.info?.(`${PLUGIN}: 已启用（只读工具 + 回问；回问深度上限 ${config.ask.maxDepth}，同对冷却 ${Math.round(config.ask.pairCooldownMs / 1000)}s）`)
 }
+
+/** 供冒烟测试使用的具名导出（宿主只认 name / inject / apply / Config）。 */
+export { collectSubtree as __collectSubtree, renderHandoffHeader as __renderHandoffHeader }
+
+export const __idleSignal = idleSignal
