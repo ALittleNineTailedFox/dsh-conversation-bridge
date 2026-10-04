@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="dsh-conversation-bridge">
+  <g fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 左：旧对话 -->
+    <rect x="4" y="14" width="20" height="36" rx="4" />
+    <!-- 右：新对话 -->
+    <rect x="40" y="14" width="20" height="36" rx="4" />
+    <!-- 桥：接力 -->
+    <path d="M24 32h16" />
+    <path d="M34 26l6 6-6 6" />
+    <!-- 桥下的"翻回原文"支线 -->
+    <path d="M34 44l-6 6h-4" opacity="0.55" />
+  </g>
+</svg>

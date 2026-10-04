@@ -13,6 +13,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { createHost, idleSignal, signalOf } from './lib/host.js'
+import { DEFAULT_SECTIONS, listHandoffs, readHandoff, resolveDir, writeHandoff } from './lib/handoff.js'
 import {
   assessTrust,
   buildOutline,
@@ -35,6 +36,22 @@ const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不�
 
 问题：{{question}}`
 
+const DEFAULT_REMINDER = `<context_handoff level="warning">
+⚠️ 本对话上下文已用到 {{percent}}%（约 {{tokens}} / {{window}} tokens，阈值 {{threshold}}%）。
+
+请按顺序做三件事：
+1. **把这件该留下的落成交接件**：调用 {{writeTool}}；四段都要写实、写具体——
+   ${DEFAULT_SECTIONS.join(' / ')}。写不下的细节不怕，原文留在日志里，下个对话能翻回来。
+2. **开新对话接上**：调用 conversation_start，把交接件全文放进 message，并传 handoffFile = 第 1 步返回的文件路径。
+   本对话 sessionId = \`{{sessionId}}\`，工作目录 = \`{{cwd}}\`。
+3. **告诉用户**：已交接、新对话的 sessionId 是返回值里的那个、本对话仍可被回问。
+
+下个对话的取数顺序是「先回问本对话拿结论；trust 不是 clean 时再翻本对话的日志原文」，
+开场消息里已经写好，不用你重复交代。
+
+如果当前改动正处在不能中断的中途，先把它落到安全状态（落盘/提交）再交接，不要带着未落盘的风险停手。
+</context_handoff>`
+
 const DEFAULTS = Object.freeze({
   exposeTools: true,
   ask: Object.freeze({
@@ -56,6 +73,22 @@ const DEFAULTS = Object.freeze({
     maxPages: 8,
     listLimit: 30,
   }),
+  handoff: Object.freeze({
+    enabled: true,
+    threshold: 0.7,
+    rearmBelow: 0.55,
+    cooldownMs: 600000,
+    handoffQuietMs: 1800000,
+    deliver: 'steer',
+    skipSubagents: true,
+    toolEnabled: true,
+    dir: '',
+    sections: DEFAULT_SECTIONS,
+    minSectionChars: 40,
+    inheritCwd: true,
+    inheritPreset: true,
+    reminderText: DEFAULT_REMINDER,
+  }),
 })
 
 /* ------------------------------------------------------------------ *
@@ -75,6 +108,18 @@ function readInteger(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(value)))
 }
 
+function readRatio(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  if (value <= 0 || value >= 1) return fallback
+  return value
+}
+
+function readSections(value, fallback) {
+  if (!Array.isArray(value) || value.length !== fallback.length) return fallback
+  const titles = value.map((item) => (typeof item === 'string' ? item.trim() : ''))
+  return titles.every((item) => item.length > 0) ? titles : fallback
+}
+
 function readText(value, fallback) {
   return typeof value === 'string' && value.trim().length > 0 ? value : fallback
 }
@@ -84,6 +129,14 @@ export function resolveConfig(input) {
   const raw = isRecord(input) ? input : {}
   const askRaw = isRecord(raw.ask) ? raw.ask : {}
   const archiveRaw = isRecord(raw.archive) ? raw.archive : {}
+  const handoffRaw = isRecord(raw.handoff) ? raw.handoff : {}
+  const threshold = readRatio(handoffRaw.threshold, DEFAULTS.handoff.threshold)
+  // 重新武装的线必须严格低于阈值，否则"超过阈值"与"回落"同时成立，提醒会被反复触发。
+  const rearmBelow = Math.max(0, Math.min(
+    readRatio(handoffRaw.rearmBelow, DEFAULTS.handoff.rearmBelow),
+    threshold - 0.01,
+    threshold * 0.9,
+  ))
   return {
     exposeTools: readBoolean(raw.exposeTools, DEFAULTS.exposeTools),
     ask: {
@@ -104,6 +157,22 @@ export function resolveConfig(input) {
       pageSize: readInteger(archiveRaw.pageSize, DEFAULTS.archive.pageSize, 1, 200),
       maxPages: readInteger(archiveRaw.maxPages, DEFAULTS.archive.maxPages, 1, 50),
       listLimit: readInteger(archiveRaw.listLimit, DEFAULTS.archive.listLimit, 1, 200),
+    },
+    handoff: {
+      enabled: readBoolean(handoffRaw.enabled, DEFAULTS.handoff.enabled),
+      threshold,
+      rearmBelow,
+      cooldownMs: readInteger(handoffRaw.cooldownMs, DEFAULTS.handoff.cooldownMs, 0, 24 * 3600 * 1000),
+      handoffQuietMs: readInteger(handoffRaw.handoffQuietMs, DEFAULTS.handoff.handoffQuietMs, 0, 7 * 24 * 3600 * 1000),
+      deliver: handoffRaw.deliver === 'queue' ? 'queue' : 'steer',
+      skipSubagents: readBoolean(handoffRaw.skipSubagents, DEFAULTS.handoff.skipSubagents),
+      toolEnabled: readBoolean(handoffRaw.toolEnabled, DEFAULTS.handoff.toolEnabled),
+      dir: typeof handoffRaw.dir === 'string' ? handoffRaw.dir.trim() : DEFAULTS.handoff.dir,
+      sections: readSections(handoffRaw.sections, DEFAULTS.handoff.sections),
+      minSectionChars: readInteger(handoffRaw.minSectionChars, DEFAULTS.handoff.minSectionChars, 0, 10000),
+      inheritCwd: readBoolean(handoffRaw.inheritCwd, DEFAULTS.handoff.inheritCwd),
+      inheritPreset: readBoolean(handoffRaw.inheritPreset, DEFAULTS.handoff.inheritPreset),
+      reminderText: readText(handoffRaw.reminderText, DEFAULTS.handoff.reminderText),
     },
   }
 }
@@ -744,6 +813,7 @@ function buildTools(api, config) {
         additionalProperties: false,
         properties: {
           message: { type: 'string', description: '新对话的第一条消息（交接时放交接件全文）' },
+          handoffFile: { type: 'string', description: '本次交接件的文件路径（由 conversation_handoff_write 返回）' },
           title: { type: 'string', description: '给新对话起的标题' },
           cwd: { type: 'string', description: '新对话的工作目录，默认继承当前对话' },
           agentPreset: { type: 'string', description: '新对话使用的 agent preset，默认继承当前对话' },
@@ -799,6 +869,7 @@ function buildTools(api, config) {
             parentSessionId,
             parentTitle: title,
             parentCwd,
+            handoffFile: readText(args.handoffFile, ''),
           })
           await api.sessionController.prompt({
             requestId: randomUUID(),
@@ -817,6 +888,124 @@ function buildTools(api, config) {
           messageSent,
           note: '需要它回答就给它发消息；它有问题时可用 conversation_ask 回问本对话，或用 conversation_outline/search/read 翻本对话的日志。',
         }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_handoffs（结论层：本插件自持的交接件）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_handoffs',
+      description:
+        '读本插件自己留存的交接件。不给 file 时给目录页（每个交接件的创建时间、来源对话、四段首行）；'
+        + '给 file 时读全文。这是"已经合上的旧书"的读后感，配合 conversation_outline/search 翻正文。'
+        + '只读本地文件，不碰任何记忆插件。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file: { type: 'string', description: '交接件文件名或绝对路径；给了就读全文' },
+          cwd: { type: 'string', description: '按该工作目录找交接件，默认当前对话的工作目录' },
+          limit: { type: 'integer', description: '目录页最多列多少个，默认 20' },
+          sinceMs: { type: 'integer', description: '只列最近这么多毫秒内创建的' },
+        },
+      },
+      output: {
+        schema: looseSchema({
+          dir: STRING,
+          total: INTEGER,
+          handoffs: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          file: STRING,
+          heads: { type: 'object', additionalProperties: true },
+          sectionText: { type: 'object', additionalProperties: true },
+          raw: STRING,
+        }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.file !== undefined
+            ? `交接件 ${value.file}\n\n${value.raw}`
+            : (value.handoffs.length === 0
+              ? `还没有交接件（目录：${value.dir}）。`
+              : `交接件目录 ${value.dir}（共 ${value.total} 个，列 ${value.handoffs.length} 个）：\n`
+                + value.handoffs.map((item) => `\n【${item.name}】${item.createdAt} 来源=${item.fromSessionId} 水位=${item.percent}%\n`
+                  + Object.entries(item.heads ?? {}).map(([title, head]) => `  ${title}：${head}`).join('\n')).join('\n')),
+        }],
+      },
+      async execute(args, exec) {
+        const session = exec?.agent?.session
+        const cwd = readText(args.cwd, typeof session?.header?.cwd === 'string' ? session.header.cwd : '')
+        if (typeof args.file === 'string' && args.file.trim().length > 0) {
+          const value = await readHandoff({ dir: config.handoff.dir, cwd, file: args.file.trim() })
+          return {
+            dir: resolveDir(config.handoff.dir, cwd),
+            file: value.file,
+            heads: value.heads,
+            sectionText: value.sectionText,
+            raw: value.raw,
+          }
+        }
+        const limit = readInteger(args.limit, 20, 1, 200)
+        const listed = await listHandoffs({
+          dir: config.handoff.dir,
+          cwd,
+          limit,
+          sinceMs: Number.isSafeInteger(args.sinceMs) ? args.sinceMs : undefined,
+        })
+        return { dir: listed.dir, total: listed.total, handoffs: listed.handoffs }
+      },
+    }),
+
+    /* ---------------------------------------------------------------- *
+     * conversation_handoff_write（写交接件：四段是硬契约）
+     * ---------------------------------------------------------------- */
+    tool({
+      name: 'conversation_handoff_write',
+      description:
+        '把该留下的写成交接件（固定四段，逐字标题由插件负责渲染）。四段都要写实、写具体；'
+        + '某段为空或过短会被**拒绝写入**并告诉你缺哪段。写完后把返回的文件路径传给 conversation_start 的 handoffFile。'
+        + '文件落在本插件自己的目录里，与任何记忆插件无关。',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['taskState', 'goals', 'deadEnds', 'nextSteps'],
+        properties: {
+          taskState: { type: 'string', description: `${config.handoff.sections[0]}：现在停在哪、有哪些产物/未落盘风险` },
+          goals: { type: 'string', description: `${config.handoff.sections[1]}：要达成的目标与判据` },
+          deadEnds: { type: 'string', description: `${config.handoff.sections[2]}：试过什么、为什么不行（这条最省下个对话的时间）` },
+          nextSteps: { type: 'string', description: `${config.handoff.sections[3]}：进度与明确的下一步` },
+          title: { type: 'string', description: '交接件标题，便于之后在目录里认出来' },
+          cwd: { type: 'string', description: '写进哪个工作目录的交接件目录，默认当前对话的工作目录' },
+        },
+      },
+      output: {
+        schema: looseSchema({ file: STRING, dir: STRING, bytes: INTEGER, chars: INTEGER, createdAt: STRING }),
+        render: (_args, value) => [{
+          type: 'text',
+          text: `交接件已落盘：${value.file}（${value.bytes} 字节）。\n`
+            + `下一步：调用 conversation_start，把交接件全文放进 message，并传 handoffFile=上面这个路径。`,
+        }],
+      },
+      async execute(args, exec) {
+        const session = exec?.agent?.session
+        const cwd = readText(args.cwd, typeof session?.header?.cwd === 'string' ? session.header.cwd : '')
+        const pressure = host.readOwnPressure(session)
+        const value = await writeHandoff({
+          dir: config.handoff.dir,
+          cwd,
+          titles: config.handoff.sections,
+          minChars: config.handoff.minSectionChars,
+          title: readText(args.title, ''),
+          fromSessionId: session?.id === undefined ? '' : String(session.id),
+          percent: pressure?.percent,
+          sections: {
+            taskState: args.taskState,
+            goals: args.goals,
+            deadEnds: args.deadEnds,
+            nextSteps: args.nextSteps,
+          },
+        })
+        api.markHandedOff(session?.id)
+        return value
       },
     }),
   ]
@@ -864,11 +1053,11 @@ function toPointView(point) {
 function renderHandoffHeader(vars) {
   return `[接力对话] 这是一段由交接产生的新对话，接替上一段对话。
 - 上一段对话 sessionId = \`${vars.parentSessionId}\`${vars.parentTitle ? `（标题：${vars.parentTitle}）` : ''}${vars.parentCwd ? `，工作目录：${vars.parentCwd}` : ''}
-- **首选**：向它回问 —— \`conversation_ask\`（sessionId=\`${vars.parentSessionId}\`，question=你的问题），
+${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conversation_handoffs 传 file 再读一遍）\n` : ''}- **首选**：向它回问 —— \`conversation_ask\`（sessionId=\`${vars.parentSessionId}\`，question=你的问题），
   然后 \`conversation_read\`（sessionId + askId）读答复；**看 trust**：
   - \`clean\` → 直接用；
   - \`compacted_by_ask\` / \`compacted_earlier\` / \`unknown\` → 结果可能失真，去翻它的原文比对。
-- **回退**：翻旧书（只读、不加压）—— \`conversation_outline\` 看目录 →
+- **回退**：翻旧书（只读、不给对方加压）—— \`conversation_outline\` 看目录 →
   \`conversation_search\` 找位置 → \`conversation_read\`（atSeq）取原文块。
 - 交接件正文在下面的消息里；真相以工作区文件与日志为准，不要只信摘要。
 
@@ -906,6 +1095,18 @@ export function apply(ctx, input = {}) {
   const host = createHost(ctx)
   const guard = createGuard(config)
 
+  /* ---- 每会话的提醒状态（进程内，不持久化） ---- */
+  const handoffStates = new Map()
+  function handoffStateFor(sessionId) {
+    const key = String(sessionId)
+    let state = handoffStates.get(key)
+    if (state === undefined) {
+      state = { armed: true, lastRemindedAt: 0, handedOffAt: 0 }
+      handoffStates.set(key, state)
+    }
+    return state
+  }
+
   const api = {
     host,
     guard,
@@ -920,20 +1121,96 @@ export function apply(ctx, input = {}) {
         /* 日志失败不影响功能 */
       }
     },
+    /** 交接件写出去之后，本对话在该时长内不再被提醒。 */
+    markHandedOff(sessionId) {
+      const id = sessionId === undefined || sessionId === null ? '' : String(sessionId)
+      if (id === '') return
+      const state = handoffStateFor(id)
+      state.handedOffAt = Date.now()
+      state.armed = false
+    },
   }
 
-  if (!config.exposeTools) {
-    ctx.logger?.info?.(`${PLUGIN}: exposeTools=false，未注册任何工具`)
-    return
-  }
-  if (!host.available()) {
-    api.warn('当前部署没有 sessionController 服务，跨对话工具未注册（插件仍正常加载）')
-    return
+  /* ---- 水位提醒（独立于工具开关） ---- */
+  if (config.handoff.enabled) {
+    // 每个模型步骤都会提交 assistant/message（有正文）或 assistant/attempt（只有工具调用）；
+    // request/context 只在路由/窗口变化时写；tool/result 会长大上下文表面。
+    const watched = new Set(['assistant/message', 'assistant/attempt', 'request/context', 'tool/result', 'turn/end'])
+
+    const evaluate = (session) => {
+      if (session === undefined || session === null) return
+      if (config.handoff.skipSubagents && session.header?.origin === 'subagent') return
+      const agent = ctx.get('agents')?.get?.(session.id)
+      if (agent === undefined) return
+      const pressure = host.readOwnPressure(agent.session)
+      if (pressure === undefined) return
+
+      const state = handoffStateFor(session.id)
+      if (pressure.ratio <= config.handoff.rearmBelow) state.armed = true
+      if (pressure.ratio < config.handoff.threshold || !state.armed) return
+
+      const now = Date.now()
+      if (now - state.lastRemindedAt < config.handoff.cooldownMs) return
+      if (now - state.handedOffAt < config.handoff.handoffQuietMs) return
+
+      const controller = api.sessionController
+      if (controller === undefined) return
+
+      state.armed = false
+      state.lastRemindedAt = now
+      const cwd = typeof session.header?.cwd === 'string' ? session.header.cwd : ''
+      const text = render(config.handoff.reminderText, {
+        percent: pressure.percent,
+        tokens: pressure.tokens,
+        window: pressure.contextWindow,
+        threshold: Math.round(config.handoff.threshold * 1000) / 10,
+        sessionId: String(session.id),
+        cwd: cwd === '' ? '（未设置）' : cwd,
+        writeTool: config.handoff.toolEnabled
+          ? '`conversation_handoff_write`（四段各写一段）'
+          : '你惯用的写文件工具（把四段写成 Markdown 小节）',
+      })
+      queueMicrotask(() => {
+        controller.prompt({
+          requestId: randomUUID(),
+          sessionId: session.id,
+          mode: config.handoff.deliver,
+          content: textBlocks(text),
+        }, idleSignal()).then(
+          () => ctx.logger?.info?.(`${PLUGIN}: 已向 ${String(session.id)} 注入交接提醒（${pressure.percent}%）`),
+          (error) => api.warn(`向 ${String(session.id)} 注入提醒失败: ${String(error)}`),
+        )
+      })
+    }
+
+    ctx.on('session/event', (session, event) => {
+      if (!watched.has(event?.type)) return
+      try {
+        evaluate(session)
+      } catch (error) {
+        api.warn(`水位检查失败: ${String(error)}`)
+      }
+    })
+    ctx.on('session/disposed', (session) => {
+      handoffStates.delete(String(session?.id))
+    })
   }
 
-  for (const definition of buildTools(api, config)) ctx.tools.register(definition)
+  /* ---- 工具 ---- */
+  let registered = 0
+  if (config.exposeTools && host.available()) {
+    for (const definition of buildTools(api, config)) {
+      ctx.tools.register(definition)
+      registered += 1
+    }
+  } else if (config.exposeTools) {
+    api.warn('当前部署没有 sessionController 服务，跨对话工具未注册（插件仍正常加载，水位提醒仍可用）')
+  }
 
-  ctx.logger?.info?.(`${PLUGIN}: 已启用（只读工具 + 回问；回问深度上限 ${config.ask.maxDepth}，同对冷却 ${Math.round(config.ask.pairCooldownMs / 1000)}s）`)
+  ctx.logger?.info?.(
+    `${PLUGIN}: 已启用（工具 ${registered} 个；水位提醒 ${config.handoff.enabled ? `${Math.round(config.handoff.threshold * 100)}%` : '关'}；`
+    + `交接件目录 ${config.handoff.dir === '' ? '（跟随会话工作目录）' : config.handoff.dir}）`,
+  )
 }
 
 /** 供冒烟测试使用的具名导出（宿主只认 name / inject / apply / Config）。 */

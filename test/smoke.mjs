@@ -1,7 +1,12 @@
 // dsh-conversation-bridge 冒烟测试：假宿主，忠实复刻宿主的 page/paginate 行为。
 // 运行：node test/smoke.mjs
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply, resolveConfig, name, inject } from '../index.js'
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
 /* ------------------------------------------------------------------ *
  * 忠实复刻：宿主的 page / paginate（字段与语义同 dsh-api-session-controller）
@@ -176,6 +181,7 @@ function createHarness(options = {}) {
 
   const tools = []
   const listeners = new Map()
+  let pressureState
   const agentsService = {
     get: (id) => liveAgents.get(String(id)),
     list: () => [...liveAgents.values()],
@@ -193,21 +199,29 @@ function createHarness(options = {}) {
       if (options.bare === true) return undefined
       if (key === 'sessionController') return controller
       if (key === 'agents') return agentsService
-      if (key === 'sessionProjections') return { stateOf: () => undefined }
+      if (key === 'sessionProjections') {
+        return { stateOf: (_session, projectionKey) => (projectionKey === 'contextPressure' ? pressureState : undefined) }
+      }
       if (key === 'tokenMeter') return { measure: () => ({ totalTokens: 80000 }) }
       return undefined
     },
   }
 
-  return {
+  const harness = {
     ctx, calls, logs, liveAgents, tools,
-    override: (patch) => Object.assign(harness.flags, patch),
     flags: {
       set compactionOnNextReply(value) { compactionOnNextReply = value },
       set replyOnNextPrompt(value) { replyOnNextPrompt = value },
       set noiseOnNextPrompt(value) { noiseOnNextPrompt = value },
     },
+    /** 设置当前会话的 live 上下文压力（readOwnPressure 走这条）。 */
+    setPressure(state) { pressureState = state },
+    /** 触发 session/event（水位提醒靠它）。 */
+    fire(session, type) {
+      for (const listener of listeners.get('session/event') ?? []) listener(session, { type })
+    },
   }
+  return harness
 }
 
 function toolMap(tools) {
@@ -232,7 +246,17 @@ assert.deepEqual(inject, ['tools'])
   const tools = toolMap(harness.tools)
   assert.deepEqual(
     [...tools.keys()].sort(),
-    ['conversation_ask', 'conversation_context', 'conversation_list', 'conversation_outline', 'conversation_read', 'conversation_search', 'conversation_start'],
+    [
+      'conversation_ask',
+      'conversation_context',
+      'conversation_handoff_write',
+      'conversation_handoffs',
+      'conversation_list',
+      'conversation_outline',
+      'conversation_read',
+      'conversation_search',
+      'conversation_start',
+    ],
   )
   for (const definition of tools.values()) {
     assert.equal(typeof definition.description, 'string')
@@ -467,4 +491,121 @@ assert.deepEqual(inject, ['tools'])
   assert.match(resolveConfig({ ask: { narrowTemplate: 'Q: {{question}}' } }).ask.narrowTemplate, /\{\{question\}\}/)
 }
 
-console.log('smoke ok: 7 个工具 + 压缩点/可信度四态 + 护栏 + 只读不唤醒 + 降级 + 配置合并')
+/* 14. 交接件：四段是硬契约（缺段/过短必须被拒），合法则原子落盘 */
+const tmpDirs = []
+async function tempDir() {
+  const dir = await mkdtemp(join(tmpdir(), 'cb-handoff-'))
+  tmpDirs.push(dir)
+  return dir
+}
+{
+  const dir = await tempDir()
+  const harness = createHarness()
+  apply(harness.ctx, { handoff: { dir } })
+  const write = toolMap(harness.tools).get('conversation_handoff_write')
+  const exec = { agent: { session: { id: 'session-aaa', header: { cwd: dir } } } }
+  const long = (tag) => `${tag}`.repeat(40)
+
+  await assert.rejects(
+    () => write.execute({ taskState: long('状态'), goals: long('目标'), deadEnds: '', nextSteps: long('下一步') }, exec),
+    /缺少段落：已试方案与失败原因/,
+  )
+  await assert.rejects(
+    () => write.execute({ taskState: long('状态'), goals: long('目标'), deadEnds: '太短', nextSteps: long('下一步') }, exec),
+    /段落太短/,
+  )
+
+  const written = await write.execute({
+    taskState: long('状态'), goals: long('目标'), deadEnds: long('弯路'), nextSteps: long('下一步'), title: '演示交接',
+  }, exec)
+  assert.match(written.file, /handoff-\d{8}-\d{9}-[a-z0-9]+-[a-z0-9]{4}\.md$/, '文件名要带时间戳(含毫秒)、来源短 id 与防撞尾巴')
+  assert.ok(written.bytes > 200)
+
+  const raw = await readFile(written.file, 'utf8')
+  assert.match(raw, /^---\n/, '必须带头部元信息')
+  assert.match(raw, /fromSessionId: session-aaa/)
+  for (const heading of ['任务状态', '目标', '已试方案与失败原因', '进度与下一步']) {
+    assert.match(raw, new RegExp(`## ${heading}`), `四个标题必须逐字渲染：${heading}`)
+  }
+  assert.match(raw, /# 演示交接/)
+
+  // 同一目录重复写不冲突；目录页按时间倒序列出
+  const second = await write.execute({
+    taskState: long('状态2'), goals: long('目标2'), deadEnds: long('弯路2'), nextSteps: long('下一步2'), title: '第二份',
+  }, exec)
+  const list = toolMap(harness.tools).get('conversation_handoffs')
+  const page = await list.execute({ limit: 10 }, exec)
+  assert.equal(page.total, 2)
+  assert.equal(page.handoffs.length, 2)
+  assert.equal(page.handoffs[0].fromSessionId, 'session-aaa')
+  assert.match(page.handoffs[0].heads['任务状态'], /状态/)
+
+  const full = await list.execute({ file: second.file }, exec)
+  assert.match(full.raw, /## 进度与下一步/)
+  assert.equal(full.sectionText['目标'].startsWith('目标2'), true)
+
+  await assert.rejects(() => list.execute({ file: 'C:\\Windows\\win.ini' }, exec), /必须位于/)
+}
+
+/* 15. 水位提醒：注入一次、不重复、回落后重新武装、交接后静默、子 agent 跳过 */
+{
+  const harness = createHarness()
+  apply(harness.ctx, { handoff: { cooldownMs: 0, handoffQuietMs: 60000 } })
+  const session = { id: 'session-live', header: { cwd: '<工作区>', origin: 'session' } }
+  harness.liveAgents.set('session-live', { id: 'session-live', session })
+  harness.setPressure({ contextWindow: 100000, pressureTokens: 80000, surfaceTokens: 0, sampledSurfaceTokens: 0 })
+
+  const before = harness.calls.prompt.length
+  harness.fire(session, 'assistant/message')
+  await settle()
+  assert.equal(harness.calls.prompt.length, before + 1, '超阈值应当注入一条提醒')
+  const reminder = harness.calls.prompt.at(-1)
+  assert.equal(reminder.sessionId, 'session-live')
+  assert.equal(reminder.mode, 'steer')
+  assert.match(reminder.content[0].text, /context_handoff/)
+  assert.match(reminder.content[0].text, /80%/)
+  assert.match(reminder.content[0].text, /conversation_handoff_write/)
+  assert.doesNotMatch(reminder.content[0].text, /mnemon|记忆插件/, '提醒里不得提任何记忆插件')
+
+  harness.fire(session, 'assistant/message')
+  await settle()
+  assert.equal(harness.calls.prompt.length, before + 1, '未重新武装前不得重复注入')
+
+  // 回落到 rearmBelow 以下 → 重新武装 → 再次提醒（cooldown 为 0）
+  harness.setPressure({ contextWindow: 100000, pressureTokens: 20000, surfaceTokens: 0, sampledSurfaceTokens: 0 })
+  harness.fire(session, 'turn/end')
+  harness.setPressure({ contextWindow: 100000, pressureTokens: 90000, surfaceTokens: 0, sampledSurfaceTokens: 0 })
+  harness.fire(session, 'assistant/message')
+  await settle()
+  assert.equal(harness.calls.prompt.length, before + 2, '占比回落后应重新武装，再次提醒')
+
+  // 子 agent 会话不提醒
+  const sub = { id: 'session-subx', header: { origin: 'subagent', cwd: '<工作区>' } }
+  harness.liveAgents.set('session-subx', { id: 'session-subx', session: sub })
+  harness.fire(sub, 'assistant/message')
+  await settle()
+  assert.equal(harness.calls.prompt.length, before + 2, '子 agent 会话不提醒')
+}
+
+/* 16. 交接后静默：写完交接件，本对话不再被提醒 */
+{
+  const dir = await tempDir()
+  const harness = createHarness()
+  apply(harness.ctx, { handoff: { dir, cooldownMs: 0, handoffQuietMs: 600000 } })
+  const session = { id: 'session-owner', header: { cwd: dir, origin: 'session' } }
+  harness.liveAgents.set('session-owner', { id: 'session-owner', session })
+  harness.setPressure({ contextWindow: 100000, pressureTokens: 85000, surfaceTokens: 0, sampledSurfaceTokens: 0 })
+
+  const long = (tag) => `${tag}`.repeat(40)
+  const write = toolMap(harness.tools).get('conversation_handoff_write')
+  await write.execute({ taskState: long('状态'), goals: long('目标'), deadEnds: long('弯路'), nextSteps: long('下一步') }, { agent: { session } })
+
+  const before = harness.calls.prompt.length
+  harness.fire(session, 'assistant/message')
+  await settle()
+  assert.equal(harness.calls.prompt.length, before, '写完交接件后本对话应进入静默')
+}
+
+for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true })
+
+console.log('smoke ok: 9 个工具 + 压缩点/可信度四态 + 护栏 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并')

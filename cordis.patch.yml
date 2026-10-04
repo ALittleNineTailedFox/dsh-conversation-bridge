@@ -48,3 +48,28 @@
           maxPages: 8
           # conversation_list 默认返回多少行
           listLimit: 30
+
+        # ---- 交接（水位提醒 + 自持交接件）----
+        handoff:
+          # 越阈值时注入一条提醒，指路"写交接件 → 开新对话"
+          enabled: true
+          # 占用到 70% 提醒；宿主的自动压缩线通常压在 0.80
+          threshold: 0.7
+          # 占比回落到该值以下才重新武装（压缩/新对话之后）
+          rearmBelow: 0.55
+          # 两次提醒之间的最小间隔（毫秒）
+          cooldownMs: 600000
+          # 交接过（或写过交接件）之后，本对话静默多久（毫秒）
+          handoffQuietMs: 1800000
+          # steer = 落进下一步并唤醒（默认）；queue = 排到下一轮
+          deliver: steer
+          # 子 agent 会话不提醒
+          skipSubagents: true
+          # 是否提供 conversation_handoff_write；关掉后提醒会改为"用你惯用的写文件工具"
+          toolEnabled: true
+          # 交接件目录；空 = <会话 cwd>/.dsh-conversation-bridge/handoffs/
+          dir: ""
+          # 每段最小字符数，不达标拒绝写入（四段是硬契约）
+          minSectionChars: 40
+          # 渲染用的四段标题（顺序即契约顺序，请勿增删）
+          sections: ["任务状态", "目标", "已试方案与失败原因", "进度与下一步"]
