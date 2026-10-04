@@ -70,6 +70,13 @@ function seedLog() {
 
 function createHarness(options = {}) {
   const logs = new Map([['session-aaa', seedLog()]])
+  // 一个子 agent 会话的日志：宿主规定它只能按 {kind:'subagent', parentSessionId} 地址读
+  logs.set('session-sub', [
+    { type: 'turn/start', seq: 0, time: 800, data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: 801, data: { content: [{ type: 'text', text: '子 agent 收到的任务' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 802, data: { message: { content: [{ type: 'text', text: '子 agent 的结论：端口号 8099' }] } } },
+    { type: 'turn/end', seq: 3, time: 803, data: { turn: 1, reason: { kind: 'completed' } } },
+  ])
   // 一个"从未被压缩过"的会话：用来区分 clean 与 compacted_earlier
   logs.set('session-clean', [
     { type: 'turn/start', seq: 0, time: 900, data: { turn: 1 } },
@@ -114,16 +121,21 @@ function createHarness(options = {}) {
     async projections(request) {
       if (request?.sessionId === undefined) throw new Error('projections 需要 sessionId')
       calls.projections.push(request.sessionId)
+      const row = summaries.find((item) => item.sessionId === request.sessionId)
+      // 忠实复刻宿主围栏：子 agent 会话没有传父地址的入口，projections 读不到
+      if (row?.origin === 'subagent') throw new Error('subagent Sessions require their durable parent address')
       if (!logs.has(request.sessionId)) return null
       return {
         asOfSeq: cursorOf(request.sessionId),
         values: {
-          title: summaries.find((row) => row.sessionId === request.sessionId)?.projections?.values?.title ?? '',
+          title: row?.projections?.values?.title ?? '',
           contextPressure: { contextWindow: 100000, pressureTokens: 80000, projectedTokens: 80000 },
         },
       }
     },
     async inspect(sessionId) {
+      const row = summaries.find((item) => item.sessionId === sessionId)
+      if (row?.origin === 'subagent') throw new Error('subagent Sessions require their durable parent address')
       return { meta: { id: sessionId }, inheritedEventCount: 0, events: eventsOf$(sessionId) }
     },
     async page(request, signal) {
@@ -132,12 +144,26 @@ function createHarness(options = {}) {
         throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
       }
       signal.throwIfAborted()
-      const sessionId = request?.address?.sessionId
+      const address = request?.address ?? {}
+      const sessionId = address.childSessionId ?? address.sessionId
       if (!logs.has(sessionId)) throw new Error(`session "${sessionId}" not found`)
+      // 忠实复刻宿主围栏：子 agent 会话必须用 {kind:'subagent', parentSessionId} 地址
+      const row = summaries.find((item) => item.sessionId === sessionId)
+      if (row?.origin === 'subagent'
+        && (address.kind !== 'subagent' || address.parentSessionId !== row.parentSessionId)) {
+        throw new Error('subagent Sessions require their durable parent address')
+      }
       const cursor = cursorOf(sessionId)
       const throughSeq = request.throughSeq === -1 ? -1 : request.throughSeq
       if (throughSeq > cursor) throw new Error(`session page through seq ${throughSeq} is past cursor ${cursor}`)
-      calls.page.push({ sessionId, throughSeq, maxMessages: request.maxMessages, beforeSeq: request.beforeSeq })
+      calls.page.push({
+        sessionId,
+        throughSeq,
+        maxMessages: request.maxMessages,
+        beforeSeq: request.beforeSeq,
+        addressKind: address.kind,
+        addressMode: address.mode,
+      })
       const page = paginate(eventsOf$(sessionId), request.beforeSeq, request.maxMessages ?? 40, throughSeq)
       return { records: page.events.map((event) => ({ type: 'event', event })), hasMore: page.hasMore }
     },
@@ -690,6 +716,112 @@ async function tempDir() {
   assert.equal(harness.calls.prompt.length, before, '写完交接件后本对话应进入静默')
 }
 
+/* 17. 输出必须是无损 JSON（真机事故的回归）：任何 undefined/NaN 都会让整个工具结果作废 */
+{
+  const hasBadValue = (value, path = '$') => {
+    if (value === undefined) return `${path} 是 undefined`
+    if (typeof value === 'number' && !Number.isFinite(value)) return `${path} 是 ${value}`
+    if (typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') return `${path} 是 ${typeof value}`
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index++) {
+        const bad = hasBadValue(value[index], `${path}[${index}]`)
+        if (bad !== null) return bad
+      }
+      return null
+    }
+    if (value !== null && typeof value === 'object') {
+      for (const [key, item] of Object.entries(value)) {
+        const bad = hasBadValue(item, `${path}.${key}`)
+        if (bad !== null) return bad
+      }
+    }
+    return null
+  }
+
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+
+  // 夹具里的 user 消息没有 source.rpcId —— 正是让真机整页作废的那种消息
+  const read = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', limit: 50 }, exec)
+  assert.ok(read.messages.some((message) => message.role === 'user'), '夹具里应当有人类 user 消息')
+  assert.equal(hasBadValue(read), null, `工具输出必须无损 JSON：${hasBadValue(read)}`)
+  assert.ok(!('rpcId' in read.messages.find((message) => message.role === 'user')), '缺 rpcId 时不得写出该键')
+
+  // 其它工具的常见返回值也过一遍
+  for (const [name, args] of [
+    ['conversation_list', { withOccupancy: true }],
+    ['conversation_context', { sessionId: 'session-aaa' }],
+    ['conversation_outline', { sessionId: 'session-aaa' }],
+    ['conversation_search', { sessionId: 'session-aaa', query: 'X=42' }],
+    ['conversation_read', { sessionId: 'session-aaa', limit: 5 }],
+  ]) {
+    const value = await tools.get(name).execute(args, exec)
+    assert.equal(hasBadValue(value), null, `${name} 的输出必须无损 JSON：${hasBadValue(value)}`)
+  }
+}
+
+/* 18. 子 agent 会话：必须用 {kind:'subagent'} 地址读（真机报 subagent Sessions require their durable parent address） */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+
+  // 自动识别：session-sub 在摘要里是 origin=subagent，插件应自己换成 subagent 地址
+  const value = await tools.get('conversation_read').execute({ sessionId: 'session-sub', limit: 10 }, exec)
+  assert.ok(value.messages.some((message) => message.text.includes('端口号 8099')), '子 agent 会话的日志应能读到')
+  const subCall = harness.calls.page.find((call) => call.sessionId === 'session-sub')
+  assert.equal(subCall.addressKind, 'subagent', '必须用 subagent 地址，否则宿主拒绝')
+  assert.ok(['unknown', 'continuable', 'one-shot'].includes(subCall.addressMode))
+
+  // 显式给父地址也应工作
+  const explicit = await tools.get('conversation_read').execute(
+    { sessionId: 'session-sub', parentSessionId: 'session-aaa', mode: 'continuable', limit: 10 }, exec)
+  assert.ok(explicit.messages.length > 0)
+
+  // 占用投影对子 agent 会话读不到 → 如实报 available:false，而不是抛错
+  const context = await tools.get('conversation_context').execute({ sessionId: 'session-sub' }, exec)
+  assert.equal(context.available, false)
+  assert.equal(context.source, 'unknown')
+}
+
+/* 19. atSeq 必须精确：指到非消息事件时报错，不许静默给别的位置 */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
+  // seq=3 是 tool/call（非消息事件）
+  await assert.rejects(
+    () => tools.get('conversation_read').execute({ sessionId: 'session-aaa', atSeq: 3 }, exec),
+    /不是可读消息/,
+  )
+  const hit = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', atSeq: 4 }, exec)
+  assert.equal(hit.requestedSeq, 4)
+  assert.equal(hit.actualSeq, 4)
+}
+
+/* 20. 交接件：写入返回的绝对路径可以直接回读（不必再传 cwd） */
+{
+  const dir = await tempDir()
+  const harness = createHarness()
+  apply(harness.ctx, { handoff: { dir } })
+  const tools = toolMap(harness.tools)
+  const long = (tag) => `${tag}`.repeat(40)
+  const other = { agent: { session: { id: 'session-aaa', header: { cwd: 'D:\\somewhere-else' } } } }
+  const written = await tools.get('conversation_handoff_write').execute(
+    { taskState: long('状态'), goals: long('目标'), deadEnds: long('弯路'), nextSteps: long('下一步') }, other)
+  const full = await tools.get('conversation_handoffs').execute({ file: written.file }, other)
+  assert.match(full.raw, /## 进度与下一步/)
+  // 但仍不得读到插件目录之外的任意文件
+  await assert.rejects(
+    () => tools.get('conversation_handoffs').execute({ file: 'C:\\Windows\\win.ini' }, other),
+    /交接件必须位于/,
+  )
+}
+
 for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true })
 
-console.log('smoke ok: 9 个工具 + 压缩点/可信度四态 + 护栏 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并')
+console.log('smoke ok: 9 个工具 + 压缩点/可信度四态 + 护栏 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')

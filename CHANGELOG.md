@@ -25,9 +25,33 @@
 - **服务缺失即降级**：没有 `sessionController` 时工具不注册但插件仍加载，只保留交接件能力。
 - **护栏**：回问深度上限、环路禁止、同对冷却、全局频率；状态在插件内推导，
   不依赖模型自觉传参。
-- 冒烟测试 16 组（假宿主，忠实复刻宿主 `paginate` 语义）。
+- 冒烟测试 20 组（假宿主，忠实复刻宿主 `paginate` 与子 agent 围栏语义）。
 
 ### 注意
 - 已知限制：子 agent 会话**不可被回问**（宿主有归属围栏），只能翻它的日志；
   要它的活结论必须通过它的主对话。
 - 需要宿主支持 `sessionController.page` / `projections` 的 `AbortSignal` 参数语义。
+
+### 修复（第 2 次真机验收后）
+- **工具输出必须无损 JSON**：缺 `rpcId` 的 user 消息曾写入 `undefined`，导致
+  `conversation_read` 在含人类消息的页上 **100% 返回 `value is not lossless JSON`**、
+  整页作废。现在所有工具输出统一过 `jsonSafe()`，且缺省字段不写键。
+- **子 agent 会话改用 `{kind:'subagent', parentSessionId, mode}` 地址读取**（原先一律按
+  `{kind:'session'}` 被宿主拒绝）；`mode` 未知时自动试探。`read`/`context`/`outline`/`search`
+  均可选传 `parentSessionId` / `mode`。占用投影对子 agent 读不到时如实报 `available:false`。
+- **`atSeq` 改为精确**：指到非消息事件时报错并给出附近可读 seq，不再静默返回别的位置。
+- **`scannedRange`**：`context` / `outline` / `search` 报告实际扫到的 seq 范围与是否到会话开头，
+  避免把"这段没扫到"误读成"从没压缩过"；`head` 为空时用 checkpoint 正文回填。
+- **交接件回读不再强制带 `cwd`**：写入返回的绝对路径可直接回读（仍拒绝插件目录之外的路径）。
+- **`conversation_list` 渲染带上总数**，被 `limit` 截断时明确提示。
+- **`conversation_ask` / `conversation_read` 渲染补齐**：`accepted` / `askDepth` / 预计占用 /
+  `answered` / `reason` / 定位 seq / 窗口内压缩点 —— 模型只能看到渲染文本，结构化字段必须可读。
+- **`conversation_start` 按 workspace 归组**（见下）：不再落到"未分组"。
+
+### 修复（第 1 次真机验收后）
+- **冷启动时工具被静默跳过**：`apply` 里用 `ctx.get('sessionController')` 探测可用性，
+  而该服务在应用启动后约 18 秒才就绪 ⇒ 9 个工具一个都没注册（entry 却显示
+  `fiberPhase: active`）。改用 `ctx.inject([...])` 等服务就绪再注册，并让不依赖会话服务的
+  本地工具立即注册。
+- `conversation_start` 改为先按工作目录 `resolveByPath` 解析 workspace 再传 `workspaceId`；
+  只传 `cwd` 会落到"未分组"。

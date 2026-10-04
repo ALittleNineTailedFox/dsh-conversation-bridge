@@ -320,6 +320,35 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
   在工具实现里写 `ctx.get(...)` 会抛 `ReferenceError`；若外面还包着 `try/catch` 做降级，
   就会**静默退化**成兜底行为（本次就是：分组解析失败退成"未分组"，冒烟测试才抓出来）。
   要用的宿主能力一律挂到传进去的 `api` 上（getter 形式，保持惰性）。
+
+### 3.10 真机验收（2026-10-04，第 2 次重启后）暴露的四条
+
+验收由子 agent 全量跑完 9 步，以下四条**用宿主日志 + 插件自身代码取证**，不是推测。
+
+- **★ 工具返回值必须是无损 JSON，否则整个结果被作废。**
+  `messageOf` 对缺 `source.rpcId` 的 `user/message` 写了 `rpcId: undefined` ⇒ 宿主报
+  `tool "conversation_read" returned invalid output: value is not lossless JSON`，
+  **整页消息全丢**。表现极具迷惑性：渲染文本完全正常、页越小越好读（小页里恰好没有人类 user 消息），
+  且 `limit` 的成败边界随内容漂移。⇒ 所有工具输出统一过 `jsonSafe()`（清 `undefined`/`NaN`/`Infinity`），
+  且**缺省字段一律不写键**而不是写 `undefined`。
+- **★ 子 agent 会话不能按 `{kind:'session'}` 读**：宿主直接拒
+  `subagent Sessions require their durable parent address`。必须用
+  `{kind:'subagent', parentSessionId, childSessionId, mode}`；`mode` 未知时按
+  `unknown → continuable → one-shot` 逐个试探并记住赢家。
+  更麻烦的是：`projections()` 与 `inspect()` **都没有传父地址的入口**（签名里只有 `sessionId`），
+  所以子 agent 会话**拿不到精确游标**——退路是用 `list()` 摘要里带的 `asOfSeq`（`resolveCursor` 路径三）。
+  占用投影同样读不到 ⇒ `conversation_context` 对子 agent 会话如实报 `available:false`，不抛错。
+- **`atSeq` 必须精确**：原实现用 `page({throughSeq: atSeq, maxMessages: 1})` 再"找不到就取页里最后一条"，
+  于是**静默返回别的位置**（真机：请求 1411→返回 1405）。`atSeq` 指向的很可能是 `tool/call`、
+  轮次边界这类非消息事件。⇒ 找不到就**报错**并给出附近最近的可读 seq，让调用方改用
+  `conversation_search` 的命中位置（那一定是消息 seq）。
+- **`conversation_context` 的"0 个压缩点"必须带范围**：它只扫尾部若干页，而压缩点可能在很前面
+  （真机：某会话 59 轮、压缩点在 seq 3299，工具报 0）。⇒ 返回值与渲染都带上
+  `scannedRange {fromSeq, toSeq, pages, reachedStart}`，"没找到"只代表"这段里没有"。
+  另外 `compaction/summary.data.summary` 可能为空，此时用同范围的 checkpoint 消息正文回填 `head`。
+- 交接件**写入返回绝对路径、回读却要求同一个 cwd** 是不对称的（真机回读被拒）。
+  ⇒ `readHandoff` 放行两种情况：在当前目标目录内，或路径本身就在本插件自己的
+  `<任意目录>/.dsh-conversation-bridge/handoffs/` 下；其它绝对路径仍然拒绝。
 - 插件清单：`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml` 插入一行；`apply(ctx, config)` 导出 `name` / `inject`。
 - 安装：`plugin_manager install_bundle`，target 传**包名**（传绝对路径二次安装会报 `ambiguous-install`）。
 - 已装包重装返回 `application: "restart-required"` ⇒ **代码与配置改动都要重启才生效**。

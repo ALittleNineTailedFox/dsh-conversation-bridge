@@ -190,6 +190,38 @@ function textBlocks(text) {
   return [{ type: 'text', text }]
 }
 
+/**
+ * 工具返回值必须是**无损 JSON**。
+ *
+ * 真机事故（2026-10-04）：`messageOf` 对缺 rpcId 的 user 消息写了 `rpcId: undefined`，
+ * 于是**整个工具结果**被判 `value is not lossless JSON` 而作废——渲染文本明明正常，
+ * 调用方只看到一个错。表现极具迷惑性：页越小越好读（小页里恰好没有人类 user 消息）。
+ * 现在所有工具输出统一过这一层，`undefined` / `NaN` / `Infinity` / 函数一律清掉。
+ */
+function jsonSafe(value, depth = 0) {
+  if (depth > 40) return null
+  if (value === null) return null
+  const type = typeof value
+  if (type === 'string' || type === 'boolean') return value
+  if (type === 'number') return Number.isFinite(value) ? value : null
+  if (type === 'undefined' || type === 'function' || type === 'symbol' || type === 'bigint') return undefined
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const safe = jsonSafe(item, depth + 1)
+      return safe === undefined ? null : safe
+    })
+  }
+  if (type === 'object') {
+    const out = {}
+    for (const [key, item] of Object.entries(value)) {
+      const safe = jsonSafe(item, depth + 1)
+      if (safe !== undefined) out[key] = safe
+    }
+    return out
+  }
+  return undefined
+}
+
 function tool(options) {
   return {
     name: options.name,
@@ -200,7 +232,9 @@ function tool(options) {
     // 纯文件类工具显式传 requiresController: false。
     requiresController: options.requiresController !== false,
     async execute(args, exec) {
-      return options.execute(isRecord(args) ? args : {}, exec)
+      const value = await options.execute(isRecord(args) ? args : {}, exec)
+      const safe = jsonSafe(value)
+      return safe === undefined ? {} : safe
     },
   }
 }
@@ -319,6 +353,7 @@ function buildTools(api, config) {
       throughSeq: cursor,
       maxMessages: config.archive.pageSize,
       maxPages,
+      ...(options.addressHint === undefined ? {} : { addressHint: options.addressHint }),
     }, signalOf(exec))
     const events = eventsOf(result.records)
     const truncated = events.length > config.archive.maxScanEvents
@@ -327,7 +362,18 @@ function buildTools(api, config) {
       events: truncated ? events.slice(events.length - config.archive.maxScanEvents) : events,
       hasMore: result.hasMore === true,
       truncated,
+      // 实际扫到的范围：调用方必须知道"没找到压缩点"只代表"这段里没有"
+      ...(Number.isSafeInteger(result.fromSeq) ? { fromSeq: result.fromSeq } : {}),
+      ...(Number.isSafeInteger(result.toSeq) ? { toSeq: result.toSeq } : {}),
+      pages: result.pages,
     }
+  }
+
+  /** 子 agent 会话必须带父地址；调用方可用 parentSessionId/mode 显式给出。 */
+  function addressHintOf(args) {
+    const parentSessionId = readText(args?.parentSessionId, '')
+    if (parentSessionId === '') return undefined
+    return { parentSessionId, mode: args?.mode }
   }
 
   return [
@@ -359,8 +405,10 @@ function buildTools(api, config) {
         render: (_args, value) => [{
           type: 'text',
           text: value.conversations.length === 0
-            ? '没有找到对话。'
-            : value.conversations.map((row) => [
+            ? `没有找到对话（匹配 ${value.total} 个）。`
+            : `匹配 ${value.total} 个，显示 ${value.conversations.length} 个`
+              + `${value.total > value.conversations.length ? '（被 limit 截断，要更多请调大 limit 或传 parentSessionId 展开子树）' : ''}：\n`
+              + value.conversations.map((row) => [
               `${row.current ? '▶ ' : '  '}${'  '.repeat(Math.min(row.depth, 4))}${row.sessionId}`,
               row.title ? ` 标题=${row.title}` : '',
               row.cwd ? ` cwd=${row.cwd}` : '',
@@ -437,6 +485,9 @@ function buildTools(api, config) {
         additionalProperties: false,
         properties: {
           sessionId: { type: 'string', description: '要查询的对话 sessionId，默认当前对话' },
+          parentSessionId: { type: 'string', description: '仅子 agent 会话需要：它的 durable 父会话 id（普通会话别传）' },
+          mode: { type: 'string', enum: ['one-shot', 'continuable', 'unknown'], description: '子 agent 地址的模式，默认 unknown（插件会自己试探）' },
+          maxPages: { type: 'integer', description: '最多向后翻几页来扫压缩点，默认 3' },
         },
       },
       output: {
@@ -452,9 +503,13 @@ function buildTools(api, config) {
         render: (_args, value) => [{
           type: 'text',
           text: !value.available
-            ? `读不到 ${value.sessionId} 的上下文占用（可能还没发起过模型请求）。`
-            : `对话 ${value.sessionId} 上下文占用：${value.percent}%（约 ${value.tokens} / ${value.contextWindow} tokens，来源 ${value.source}）；`
-              + `历史压缩点 ${value.compactionPoints.length} 个。`,
+            ? `读不到 ${value.sessionId} 的上下文占用（可能还没发起过模型请求；子 agent 会话的占用投影本身读不到）。`
+            : `对话 ${value.sessionId} 上下文占用：${value.percent}%（约 ${value.tokens} / ${value.contextWindow} tokens，来源 ${value.source}）。\n`
+              + renderScannedRange(value.scannedRange)
+              + `该范围内压缩点 ${value.compactionPoints.length} 个`
+              + (value.compactionPoints.length === 0
+                ? `${value.scannedRange?.reachedStart === false ? '（**未扫到会话开头**，更早处可能还有）' : ''}。`
+                : `：\n${value.compactionPoints.map(renderPointLine).join('\n')}`),
         }],
       },
       async execute(args, exec) {
@@ -464,7 +519,10 @@ function buildTools(api, config) {
           : selfSessionId(exec)
         if (requested === '') throw new Error(`${PLUGIN}: 没有可用的 sessionId`)
         const pressure = await host.readPressureById(requested, signalOf(exec))
-        const scan = await scanSession(requested, exec, { maxPages: 3 })
+        const scan = await scanSession(requested, exec, {
+          maxPages: readInteger(args.maxPages, 3, 1, 50),
+          ...(addressHintOf(args) === undefined ? {} : { addressHint: addressHintOf(args) }),
+        })
         const points = collectCompactionPoints(scan.events, { headChars: 120 })
         return {
           sessionId: requested,
@@ -473,6 +531,13 @@ function buildTools(api, config) {
           contextWindow: pressure?.contextWindow ?? 0,
           percent: pressure?.percent ?? 0,
           source: pressure?.source ?? 'unknown',
+          // 报告实际扫到的范围：不报范围的话，"0 个压缩点"会被误读成"这个会话从没压缩过"
+          scannedRange: {
+            ...(Number.isSafeInteger(scan.fromSeq) ? { fromSeq: scan.fromSeq } : {}),
+            ...(Number.isSafeInteger(scan.toSeq) ? { toSeq: scan.toSeq } : {}),
+            pages: scan.pages ?? 0,
+            reachedStart: scan.hasMore !== true,
+          },
           compactionPoints: points.map(toPointView),
         }
       },
@@ -492,6 +557,8 @@ function buildTools(api, config) {
         required: ['sessionId'],
         properties: {
           sessionId: { type: 'string', description: '要看的对话 sessionId' },
+          parentSessionId: { type: 'string', description: '仅子 agent 会话需要：它的 durable 父会话 id' },
+          mode: { type: 'string', enum: ['one-shot', 'continuable', 'unknown'], description: '子 agent 地址的模式，默认 unknown' },
           maxTurns: { type: 'integer', description: `最多给多少轮（取最新的），默认 ${config.archive.outlineMaxTurns}` },
           maxPages: { type: 'integer', description: `最多向后翻几页，默认 ${config.archive.maxPages}` },
         },
@@ -515,14 +582,22 @@ function buildTools(api, config) {
                 turn.hasToolCalls ? ' [有工具]' : '',
                 turn.toolFailures > 0 ? ` [工具失败×${turn.toolFailures}]` : '',
                 turn.compacted ? ' [含压缩点]' : '',
-              ].join('')).join('\n'),
+              ].join('')).join('\n')
+              + `\n${renderScannedRange(value.scannedRange)}`
+              + `该范围内压缩点 ${value.compactionPoints.length} 个`
+              + (value.compactionPoints.length === 0
+                ? `${value.scannedRange?.reachedStart === false ? '（**未扫到会话开头**，更早处可能还有）' : ''}。`
+                : `：\n${value.compactionPoints.map(renderPointLine).join('\n')}`),
         }],
       },
       async execute(args, exec) {
         requireHost()
         const sessionId = readText(args.sessionId, '')
         if (sessionId === '') throw new Error(`${PLUGIN}: conversation_outline 需要 sessionId`)
-        const scan = await scanSession(sessionId, exec, { maxPages: args.maxPages })
+        const scan = await scanSession(sessionId, exec, {
+          maxPages: args.maxPages,
+          ...(addressHintOf(args) === undefined ? {} : { addressHint: addressHintOf(args) }),
+        })
         if (scan.unreadable === true) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
         const outline = buildOutline(scan.events, {
           maxTurns: readInteger(args.maxTurns, config.archive.outlineMaxTurns, 1, 500),
@@ -533,6 +608,12 @@ function buildTools(api, config) {
           totalTurns: outline.totalTurns,
           truncated: outline.truncated || scan.truncated === true,
           turns: outline.turns,
+          scannedRange: {
+            ...(Number.isSafeInteger(scan.fromSeq) ? { fromSeq: scan.fromSeq } : {}),
+            ...(Number.isSafeInteger(scan.toSeq) ? { toSeq: scan.toSeq } : {}),
+            pages: scan.pages ?? 0,
+            reachedStart: scan.hasMore !== true,
+          },
           compactionPoints: outline.compactionPoints.map(toPointView),
         }
       },
@@ -561,6 +642,8 @@ function buildTools(api, config) {
           },
           limit: { type: 'integer', description: `最多返回多少条命中，默认 ${config.archive.maxHits}` },
           maxPages: { type: 'integer', description: `最多向后翻几页，默认 ${config.archive.maxPages}` },
+          parentSessionId: { type: 'string', description: '仅子 agent 会话需要：它的 durable 父会话 id' },
+          mode: { type: 'string', enum: ['one-shot', 'continuable', 'unknown'], description: '子 agent 地址的模式，默认 unknown' },
         },
       },
       output: {
@@ -584,7 +667,10 @@ function buildTools(api, config) {
         const query = readText(args.query, '')
         if (sessionId === '') throw new Error(`${PLUGIN}: conversation_search 需要 sessionId`)
         if (query === '') throw new Error(`${PLUGIN}: conversation_search 需要 query`)
-        const scan = await scanSession(sessionId, exec, { maxPages: args.maxPages })
+        const scan = await scanSession(sessionId, exec, {
+          maxPages: args.maxPages,
+          ...(addressHintOf(args) === undefined ? {} : { addressHint: addressHintOf(args) }),
+        })
         if (scan.unreadable === true) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
         const roles = Array.isArray(args.roles) && args.roles.length > 0
           ? args.roles.filter((role) => typeof role === 'string')
@@ -599,6 +685,12 @@ function buildTools(api, config) {
           sessionId,
           scanned: result.scanned,
           truncated: scan.truncated === true || scan.hasMore === true,
+          scannedRange: {
+            ...(Number.isSafeInteger(scan.fromSeq) ? { fromSeq: scan.fromSeq } : {}),
+            ...(Number.isSafeInteger(scan.toSeq) ? { toSeq: scan.toSeq } : {}),
+            pages: scan.pages ?? 0,
+            reachedStart: scan.hasMore !== true,
+          },
           hits: result.hits,
         }
       },
@@ -625,6 +717,8 @@ function buildTools(api, config) {
           atSeq: { type: 'integer', description: '取该 seq 的原文块' },
           limit: { type: 'integer', description: `最多读多少条消息，默认 ${config.archive.pageSize}` },
           includeTools: { type: 'boolean', description: '是否包含工具结果（默认 true；压缩最容易丢的就是它）' },
+          parentSessionId: { type: 'string', description: '仅子 agent 会话需要：它的 durable 父会话 id（宿主会拒绝对子会话按普通会话读）' },
+          mode: { type: 'string', enum: ['one-shot', 'continuable', 'unknown'], description: '子 agent 地址的模式，默认 unknown' },
         },
       },
       output: {
@@ -651,22 +745,32 @@ function buildTools(api, config) {
         const includeTools = args.includeTools !== false && config.archive.includeToolResults
         const roles = includeTools ? ['user', 'assistant', 'tool'] : ['user', 'assistant']
 
-        // ③ 取原文块
+        // ③ 取原文块：**必须是那一个 seq**，静默给别的位置比报错更有害
         if (Number.isSafeInteger(args.atSeq)) {
           const page = await host.readPage({
             sessionId,
             throughSeq: args.atSeq,
-            maxMessages: 1,
+            maxMessages: config.archive.pageSize,
+            ...(addressHintOf(args) === undefined ? {} : { addressHint: addressHintOf(args) }),
           }, signalOf(exec))
           const events = eventsOf(page.records)
           const messages = extractMessages(events, { roles, maxChars })
           const block = messages.find((message) => message.seq === args.atSeq)
-            ?? messages[messages.length - 1]
-          if (block === undefined) throw new Error(`${PLUGIN}: seq=${args.atSeq} 处没有可读消息`)
-          return { sessionId, block, messages: [block] }
+          if (block === undefined) {
+            const nearest = messages
+              .map((message) => message.seq)
+              .sort((left, right) => Math.abs(left - args.atSeq) - Math.abs(right - args.atSeq))[0]
+            throw new Error(
+              `${PLUGIN}: seq=${args.atSeq} 处不是可读消息（该位置可能是工具调用、轮次边界等非消息事件）。`
+              + `${nearest === undefined ? '' : `附近最近的可读消息 seq=${nearest}。`}`
+              + '请用 conversation_search 的命中位置（那一定是消息 seq）下探。',
+            )
+          }
+          return { sessionId, block, messages: [block], requestedSeq: args.atSeq, actualSeq: block.seq }
         }
 
         // ①② 读最新一页 / 读某次回问的答复
+        const hint = addressHintOf(args)
         const cursor = await host.resolveCursor(sessionId, signalOf(exec))
         if (cursor === undefined) throw new Error(`${PLUGIN}: 读不到对话 ${sessionId}`)
         if (cursor < 0) {
@@ -677,6 +781,7 @@ function buildTools(api, config) {
           throughSeq: cursor,
           maxMessages: readInteger(args.limit, config.archive.pageSize, 1, 200),
           maxPages: args.askId === undefined ? 1 : config.archive.maxPages,
+          ...(hint === undefined ? {} : { addressHint: hint }),
         }, signalOf(exec))
         const events = eventsOf(pages.records)
         const messages = extractMessages(events, { roles, maxChars }).slice(-readInteger(args.limit, config.archive.pageSize, 1, 200))
@@ -744,10 +849,13 @@ function buildTools(api, config) {
         }),
         render: (_args, value) => [{
           type: 'text',
-          text: `已向对话 ${value.sessionId} 回问（mode=${value.mode}，askId=${value.askId}${value.narrowed ? '，窄指令' : ''}）。\n`
-            + `对方占用${value.occupancyBefore?.percent === undefined ? '未知' : ` ${value.occupancyBefore.percent}%`}`
-            + `（来源 ${value.occupancyBefore?.source ?? 'unknown'}），本轮压缩风险：${value.compactionRisk}。\n`
-            + `${value.compactionRisk === 'likely' ? '⚠️ 这一问很可能把它推过压缩线，答复可能失真——拿到后用 conversation_read 的 trust 判断，必要时翻旧书比对。\n' : ''}`
+          text: `已向对话 ${value.sessionId} 回问：accepted=${value.accepted}，mode=${value.mode}，askDepth=${value.askDepth}`
+            + `，窄指令=${value.narrowed}\n`
+            + `askId=${value.askId}（读答复要用它）\n`
+            + `对方占用${value.occupancyBefore?.percent === undefined ? '未知（该项目标没有可读的占用投影）' : ` ${value.occupancyBefore.percent}%（来源 ${value.occupancyBefore.source}）`}`
+            + `${value.projectedAfterPercent === undefined ? '' : `，加上这一问预计 ${value.projectedAfterPercent}%`}`
+            + `，压缩风险：${value.compactionRisk}\n`
+            + `${value.compactionRisk === 'likely' ? '⚠️ 这一问很可能把它推过压缩线，答复可能失真——拿到后看 trust，必要时翻旧书比对。\n' : ''}`
             + `稍后用 conversation_read（sessionId=${value.sessionId}，askId=${value.askId}）读取答复与可信度。`,
         }],
       },
@@ -1079,14 +1187,28 @@ function collectSubtree(rows, rootId) {
 function toPointView(point) {
   return {
     seq: pointSeq(point),
-    summarySeq: point.summarySeq,
-    checkpointSeq: point.checkpointSeq,
-    startSeq: point.startSeq,
-    endSeq: point.endSeq,
+    ...(Number.isSafeInteger(point.summarySeq) ? { summarySeq: point.summarySeq } : {}),
+    ...(Number.isSafeInteger(point.checkpointSeq) ? { checkpointSeq: point.checkpointSeq } : {}),
+    ...(Number.isSafeInteger(point.startSeq) ? { startSeq: point.startSeq } : {}),
+    ...(Number.isSafeInteger(point.endSeq) ? { endSeq: point.endSeq } : {}),
     time: point.time,
-    tokenCount: point.tokenCount,
-    head: point.head,
+    ...(Number.isFinite(point.tokenCount) ? { tokenCount: point.tokenCount } : {}),
+    head: typeof point.head === 'string' ? point.head : '',
   }
+}
+
+function renderScannedRange(range) {
+  if (!isRecord(range)) return ''
+  const from = Number.isSafeInteger(range.fromSeq) ? range.fromSeq : '?'
+  const to = Number.isSafeInteger(range.toSeq) ? range.toSeq : '?'
+  return `实际扫描范围：seq ${from}..${to}（${range.pages ?? 0} 页`
+    + `${range.reachedStart === false ? '，**未到会话开头**' : '，已到会话开头'}）\n`
+}
+
+function renderPointLine(point) {
+  return `  · seq=${point.seq} 覆盖 seq=${point.startSeq ?? '?'}..${point.endSeq ?? '?'}`
+    + `${Number.isFinite(point.tokenCount) ? ` 折叠 ${point.tokenCount} tokens` : ''}`
+    + `${point.head ? `｜${point.head.slice(0, 80)}` : ''}`
 }
 
 function renderHandoffHeader(vars) {
@@ -1107,18 +1229,32 @@ ${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conve
 
 function renderReadResult(value) {
   if (value.block !== undefined) {
-    return `[seq=${value.block.seq} ${value.block.role}/${value.block.kind}]\n${value.block.text}`
+    const mismatch = Number.isSafeInteger(value.requestedSeq) && value.requestedSeq !== value.block.seq
+      ? `（请求 seq=${value.requestedSeq}，实际 seq=${value.block.seq}）`
+      : ''
+    return `[seq=${value.block.seq} ${value.block.role}/${value.block.kind}]${mismatch}\n${value.block.text}`
   }
-  const head = value.trust === undefined || value.trust === 'unknown'
-    ? ''
-    : (value.trust === 'clean'
-      ? '可信度：clean —— 答复基于真实表面，可直接使用。\n'
-      : `可信度：${value.trust}（${value.reason ?? ''}）—— 答复可能失真，建议翻旧书比对原文。\n`)
+  const lines = []
+  if (value.trust !== undefined) {
+    lines.push(value.trust === 'clean'
+      ? '可信度：clean —— 答复基于真实表面，可直接使用。'
+      : `可信度：${value.trust}${value.reason ? `（${value.reason}）` : ''}`
+        + `${value.answered === false ? '；**对方还没回**，稍后再读' : ' —— 答复可能失真，建议翻旧书比对原文。'}`)
+  }
+  if (value.questionSeq !== undefined || value.replySeq !== undefined) {
+    lines.push(`定位：提问 seq=${value.questionSeq ?? '?'} → 答复 seq=${value.replySeq ?? '（尚无）'}`)
+  }
+  if (Array.isArray(value.compactionPoints) && value.compactionPoints.length > 0) {
+    lines.push(`窗口内压缩点：\n${value.compactionPoints.map(renderPointLine).join('\n')}`)
+  }
+  if (value.occupancyAfter !== undefined) {
+    lines.push(`对方当前占用：${value.occupancyAfter.percent}%（来源 ${value.occupancyAfter.source}）`)
+  }
   const body = value.messages.length === 0
     ? '（没有可读消息）'
     : value.messages.map((message) =>
       `[seq=${message.seq} ${message.role}/${message.kind}] ${message.text}`).join('\n\n')
-  return `${head}${body}`
+  return `${lines.length > 0 ? `${lines.join('\n')}\n\n` : ''}${body}`
 }
 
 /* ------------------------------------------------------------------ *
