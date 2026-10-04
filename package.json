@@ -1,0 +1,34 @@
+{
+  "name": "dsh-conversation-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "跨对话通信 + 上下文接力提醒：让一个对话可以新建对话、向另一个对话发消息/读消息，并在上下文占用超过阈值时提醒当前 AI 写交接文档并开启新对话。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "conversation",
+    "handoff",
+    "context"
+  ],
+  "license": "MIT"
+}

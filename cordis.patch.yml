@@ -1,0 +1,40 @@
+# Bundle patch layer for dsh-conversation-bridge.
+#
+# The row loads this package's main entry (index.js) as a plain Cordis host
+# plugin. It is host-only: no client half, no dependencies.
+#
+# All values below are the plugin's defaults; edit or delete them in your own
+# profile patch layer (`<profile>/cordis.patch.yml`) — the id is
+# `conversation-bridge`, so an `- id: conversation-bridge` entry with a
+# `config:` block overrides this completely.
+- insert:
+    - id: conversation-bridge
+      name: dsh-conversation-bridge
+      config:
+        # ---- 功能 1：跨对话工具 ----
+        exposeTools: true
+
+        # ---- 功能 2：上下文接力提醒 ----
+        enabled: true
+        # 占用率到达该值时提醒（0.7 = 70%）
+        threshold: 0.7
+        # 占用率回落到该值以下才重新武装提醒（压缩/新对话后）
+        rearmBelow: 0.55
+        # 两次提醒之间的最小间隔（毫秒），避免连续刷屏
+        cooldownMs: 600000
+        # 交接后在该时长内不再提醒本对话（毫秒）
+        handoffQuietMs: 1800000
+        # 交付方式：steer = 落进下一步并立即唤醒（默认）；queue = 排到下一轮
+        deliver: steer
+        # 子 agent 会话不提醒
+        skipSubagents: true
+        # 交给新对话的开场消息里自动带上"如何回问上一段对话"
+        handoffHeader: true
+        # 新建对话默认继承本对话的工作目录与 agent preset
+        inheritCwd: true
+        inheritPreset: true
+        # conversation_list / conversation_read 的默认条数
+        listLimit: 30
+        readLimit: 30
+        # 单条读取消息的最大字符数
+        maxMessageChars: 4000

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Conversation Bridge",
+    "description": "Cross-conversation messaging plus context handoff: start a new conversation, message another conversation or read its latest replies, and get reminded to write a handoff document and continue in a fresh conversation once context occupancy passes 70%."
+  }
+}

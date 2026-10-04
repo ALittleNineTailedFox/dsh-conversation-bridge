@@ -1,0 +1,11 @@
+# 依赖（本插件刻意零运行时依赖，这里只是防未来）
+node_modules/
+
+# 插件默认的交接件目录（若把本插件用在本仓上，会写到这里）
+.dsh-conversation-bridge/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
