@@ -9,3 +9,6 @@ node_modules/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 下划线临时件（交接件等，遵约定不入库）
+_HANDOFF*.md
