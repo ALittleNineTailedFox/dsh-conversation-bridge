@@ -646,6 +646,13 @@ createUserMessage({ content, source })  →  session.append("user/message", mess
 - 答复延迟可能跨多个页：`read` 若 `hasMore`，先继续翻再判 trust。
 - 若对方**根本没用模型**（例如直接由别处写入），`replySeq` 可能找不到 ⇒ `unknown`。
 - 判定只覆盖"这一轮"。对方如果有**并发**其它输入，噪声会进窗口 ⇒ 保守判 `unknown`（宁可多翻一次书）。
+- **插件自己发的消息不算「真人并发」**：宿主 `prompt` 投递的消息 source 是 `{kind:user, rpcId}`，
+  与真人输入无法区分；若不处理，多轮往返（A 问 B → B 反问 A → A 回 B）里 A 读第一问的答复
+  会看到「提问之后又出现一条真人 user 消息」⇒ 误判 `concurrent-input`（插件自我污染）。
+  所以本插件给每次跨对话投递的 `rpcId` 加固定前缀 **`bridge-`**；判「真人输入」时带该前缀的一律排除，
+  顶层的消息 `id` 仍用裸 UUID（不污染宿主自己的 id 空间）。
+  边界：① 要求**通信双方都装本插件**才能互相识别；② 加前缀之前的历史消息仍会被人声噪声命中；
+  ③ 更彻底的解法在宿主侧——让 `prompt` 支持 plugin 来源，届时可去掉这条约定。
 
 ---
 

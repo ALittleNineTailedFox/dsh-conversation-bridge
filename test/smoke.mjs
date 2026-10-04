@@ -94,6 +94,7 @@ function createHarness(options = {}) {
   const liveAgents = new Map()
   let compactionOnNextReply = false
   let replyOnNextPrompt = true
+  let bridgeNoiseOnNextPrompt = false
   let noiseOnNextPrompt = false
   let nonHumanNoiseOnNextPrompt = false
   // 复刻真机时序：对方先写一条"只有工具调用、没有文本"的助手帧，下一帧才给答案。
@@ -196,6 +197,11 @@ function createHarness(options = {}) {
           // 复刻真实宿主会写的模型切换提示：user 角色，但 source.kind 不是 user
           append(request.sessionId, { type: 'user/message', time: 2004, data: { content: [{ type: 'text', text: '[model changed: ...]' }], source: { kind: 'model-selection', form: 'notice' } } })
         }
+        if (bridgeNoiseOnNextPrompt) {
+          // 另一条**由本插件投递**的跨对话消息：user 角色 + rpcId 带桥前缀。
+          // 它不该被算成"真人并发插话"，否则多轮往返会把上一条提问的 trust 打成 unknown。
+          append(request.sessionId, { type: 'user/message', time: 2004, data: { content: [{ type: 'text', text: '另一条跨对话消息' }], source: { kind: 'user', rpcId: 'bridge-other-id' } } })
+        }
         if (toolCallOnNextReply) {
           // 只落工具调用帧、本轮不给文本：真实场景里对方正在跑工具、还没答
           append(request.sessionId, { type: 'assistant/message', time: 2004, data: { message: { content: [{ type: 'tool-call', name: 'pwsh', arguments: '{}' }] } } })
@@ -278,6 +284,7 @@ function createHarness(options = {}) {
       set compactionOnNextReply(value) { compactionOnNextReply = value },
       set replyOnNextPrompt(value) { replyOnNextPrompt = value },
       set noiseOnNextPrompt(value) { noiseOnNextPrompt = value },
+      set bridgeNoiseOnNextPrompt(value) { bridgeNoiseOnNextPrompt = value },
       set nonHumanNoiseOnNextPrompt(value) { nonHumanNoiseOnNextPrompt = value },
       set toolCallOnNextReply(value) { toolCallOnNextReply = value },
     },
@@ -456,6 +463,7 @@ assert.deepEqual(inject, ['tools'])
   assert.match(harness.calls.prompt.at(-1).content[0].text, /conversation_send/, '正文必须写明回信方法')
   assert.equal(askedClean.compactionRisk, 'likely', '对方已在 80% → 事前就要预警')
   assert.equal(askedClean.occupancyBefore.source, 'cached')
+  assert.match(askedClean.messageId, /^bridge-/, '跨对话投递的 rpcId 必须带桥前缀（收信侧靠它识别"这是插件发的"）')
   const clean = await tools.get('conversation_read').execute({ sessionId: 'session-clean', messageId: askedClean.messageId }, exec)
   assert.equal(clean.trust, 'clean')
   assert.equal(clean.answered, true)
@@ -497,6 +505,15 @@ assert.deepEqual(inject, ['tools'])
   const injected = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked5.messageId }, exec)
   assert.notEqual(injected.trust, 'unknown', '模型切换提示这类注入不得把 trust 打成 unknown')
   harness.flags.nonHumanNoiseOnNextPrompt = false
+
+  // 本插件自己投递的另一条跨对话消息（rpcId 带 bridge- 前缀）也不得算成真人并发：
+  // 否则多轮往返（A问B → B反问A → A回B）会把上一条提问的 trust 打成 unknown —— 插件自我污染
+  harness.flags.bridgeNoiseOnNextPrompt = true
+  const asked6b = await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '多轮往返里的另一问' }, as('session-iii'))
+  const afterBridgeNoise = await tools.get('conversation_read').execute({ sessionId: 'session-aaa', messageId: asked6b.messageId }, exec)
+  assert.notEqual(afterBridgeNoise.trust, 'unknown', '带 bridge- 前缀的跨对话消息不得被算成真人并发插话')
+  assert.notEqual(afterBridgeNoise.reason, 'concurrent-input')
+  harness.flags.bridgeNoiseOnNextPrompt = false
 
   // 不给 messageId → 只能给 unknown，不得假装可信
   const bare = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, exec)

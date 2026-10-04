@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { createHost, idleSignal, signalOf } from './lib/host.js'
 import { DEFAULT_SECTIONS, listHandoffs, readHandoff, resolveDir, writeHandoff } from './lib/handoff.js'
 import {
+  BRIDGE_RPC_PREFIX,
   assessTrust,
   buildOutline,
   collectCompactionPoints,
@@ -29,6 +30,17 @@ export const name = PLUGIN
 
 /** 只硬依赖工具注册表；其余宿主服务用 ctx.get() 可选获取，缺失即降级。 */
 export const inject = ['tools']
+
+/**
+ * 每次跨对话投递的 `rpcId` 都带 {@link BRIDGE_RPC_PREFIX}。
+ *
+ * 宿主把 `prompt` 投递的消息一律写成 `{kind:'user', rpcId}`，与真人输入无法区分；
+ * 加前缀后，**装了本插件的收信方**就能把这条识别成"插件发的"，不误判成真人并发插话
+ * （否则插件自己发的反问/回信会把上一条提问的 `trust` 打成 `unknown`）。
+ */
+function bridgeRequestId() {
+  return `${BRIDGE_RPC_PREFIX}${randomUUID()}`
+}
 
 const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不要改文件、不要展开、不要重做已做过的工作。
 如果结论在你开过的子 agent 手里，直接让那个子 agent 把结论给你，不要自己重跑。
@@ -998,7 +1010,7 @@ function buildTools(api, config) {
             + `所以回信请发给它的父对话 sessionId=${replyTo}（上面落款里的地址就是它，直接照用即可）。`
           : ''
         const body = `${bodyText}\n${guide}${relayNote}`
-        const messageId = randomUUID()
+        const messageId = bridgeRequestId()
 
         const occupancyBefore = await host.readPressureById(sessionId, signalOf(exec))
         const estimate = Math.ceil(body.length / 3) + config.ask.replyAllowanceTokens
@@ -1158,7 +1170,7 @@ function buildTools(api, config) {
             handoffFile: readText(args.handoffFile, ''),
           })
           await api.sessionController.prompt({
-            requestId: randomUUID(),
+            requestId: bridgeRequestId(),
             sessionId,
             mode: 'steer',
             content: textBlocks(`${header}${body}`),
@@ -1533,7 +1545,7 @@ export function apply(ctx, input = {}) {
       })
       queueMicrotask(() => {
         controller.prompt({
-          requestId: randomUUID(),
+          requestId: bridgeRequestId(),
           sessionId: session.id,
           mode: config.handoff.deliver,
           content: textBlocks(text),
