@@ -650,7 +650,7 @@ createUserMessage({ content, source })  →  session.append("user/message", mess
   与真人输入无法区分；若不处理，多轮往返（A 问 B → B 反问 A → A 回 B）里 A 读第一问的答复
   会看到「提问之后又出现一条真人 user 消息」⇒ 误判 `concurrent-input`（插件自我污染）。
   所以本插件给每次跨对话投递的 `rpcId` 加固定前缀 **`bridge-`**；判「真人输入」时带该前缀的一律排除，
-  顶层的消息 `id` 仍用裸 UUID（不污染宿主自己的 id 空间）。
+  前缀只落在 `source.rpcId` 上；消息的 `id` 由宿主自己生成，不受影响。
   边界：① 要求**通信双方都装本插件**才能互相识别；② 加前缀之前的历史消息仍会被人声噪声命中；
   ③ 更彻底的解法在宿主侧——让 `prompt` 支持 plugin 来源，届时可去掉这条约定。
 
