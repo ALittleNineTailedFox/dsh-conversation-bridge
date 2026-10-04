@@ -31,6 +31,19 @@
 - 已知限制：子 agent 会话**不可被回问**（宿主有归属围栏），只能翻它的日志；
   要它的活结论必须通过它的主对话。
 - 需要宿主支持 `sessionController.page` / `projections` 的 `AbortSignal` 参数语义。
+- **已存在的对话看不到新装的工具**：DSH 按会话落盘复用系统提示词（含工具清单），
+  想用本插件请**开新对话**。装完或升级后还需**重启 DSH**（插件代码/配置不热重载）。
+- 启动后约 20 秒内 `sessionController` 未就绪，该窗口内新建的会话可能看不到跨对话工具。
+
+### 修复（第 3 次真机复验后，于第 4 次重启验证通过）
+- `conversation_search` 的渲染补上 `scannedRange`（0 命中与有命中两种情况都给出实际扫描
+  范围与"是否到会话开头"），与 `context`/`outline` 一致。
+- **回问的 `trust` 不再被非真人消息误判**：`<goal_round>`、模型切换提示等也是 user 角色消息，
+  原先一律算作"并发输入"，导致 `trust` 几乎恒为 `unknown`，等于废掉"先回问拿结论"这条首选路。
+  现在只有 `source.kind === 'user'`（真人输入）才算并发噪声。
+- 假宿主纠正保真度：子 agent 围栏只在 `page` 上，`projections`/`inspect` 能读。
+- 交接提醒文案改为工具无关：`conversation_handoff_write` 不可见时（本会话提示词冻结于安装之前）
+  改用惯用的写文件工具写到 `handoffDir`，并在提醒里给出真实目录。
 
 ### 修复（第 2 次真机验收后）
 - **工具输出必须无损 JSON**：缺 `rpcId` 的 user 消息曾写入 `undefined`，导致
