@@ -76,6 +76,10 @@ const DEFAULTS = Object.freeze({
     maxDepth: 3,
     pairCooldownMs: 600000,
     globalPerMinute: 30,
+    // 默认必须走**插入**（用户裁定）：对方正在思考/跑工具时，这条插进它下一步就能看到；
+    // 排在"本轮结束之后"会让发送方看起来在干等，而且对方思考中根本收不到。
+    // 需要"等它本轮跑完再问"时才显式传 queue。
+    // 这里必须与 cordis.patch.yml 保持一致——默认值两处各说各话，排查起来极费时间（真机踩过）。
     defaultMode: 'steer',
     narrow: true,
     narrowTemplate: DEFAULT_ASK_TEMPLATE,

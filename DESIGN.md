@@ -844,7 +844,7 @@ ask:
   maxDepth: 3
   pairCooldownMs: 600000
   globalPerMinute: 30
-  defaultMode: queue
+  defaultMode: steer          # steer = 插进对方当前回合下一步（默认）；queue = 等它本轮跑完
   narrow: true
   narrowTemplate: |        # {{question}} 会被替换
     只回答下面这个问题，不要复盘、不要改文件、不要展开、不要重做已做过的工作。

@@ -23,8 +23,10 @@
           pairCooldownMs: 600000
           # 全局限流：每分钟最多发多少次回问
           globalPerMinute: 30
-          # queue = 排到对方下一轮（默认）；steer = 插到它当前回合下一步
-          defaultMode: queue
+          # steer = 插进对方当前回合的下一步（**默认**：对方正在思考/跑工具也能立刻看到）；
+          # queue = 等对方本轮跑完再排（需要"不打断它"时才显式用）。
+          # 注意：这里与代码里的 DEFAULTS 必须一致——两处默认值各说各话，真机排查极费时间。
+          defaultMode: steer
           # 是否把问题包成窄指令（只回答、不复盘、不重做、不动文件）
           narrow: true
           # 估算"这一问之后对方会涨多少 token"时，给答复预留的量

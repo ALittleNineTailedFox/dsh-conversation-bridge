@@ -102,7 +102,7 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
       maxDepth: 3              # 消息链最大跳数（超过就劝去翻旧书）
       pairCooldownMs: 600000   # 同一对会话的最小间隔
       globalPerMinute: 30      # 全局限流
-      defaultMode: queue       # queue | steer
+      defaultMode: steer       # steer = 插进对方下一步（默认）| queue = 等它本轮跑完
       narrow: true             # 包成窄指令（只回答、不复盘、不重做）
       replyAllowanceTokens: 1500
     archive:
