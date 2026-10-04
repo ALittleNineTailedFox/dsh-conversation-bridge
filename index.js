@@ -397,6 +397,26 @@ function buildTools(api, config) {
     if (held === 'self-subagent') throw subagentHeldError(sessionId)
   }
 
+  /**
+   * 决定"对方该把回信发到哪"。
+   *
+   * **发送方自己是子 agent 会话时，回信地址必须换成它的父对话**：子 agent 会话不接受任何投递
+   * （宿主 `hasApiSessionSubagentOwner`），如果落款照旧写它自己的 sessionId，
+   * 对方一按落款回信就被拒——闭环断在"回信进不来"这一侧（真机实测就是这个：
+   * 子 agent 问了一个对话，那个对话答完想回信，回不进去）。
+   *
+   * 父对话能正常收投递，所以让它当中继；子 agent 的结论本来也是要回到父对话的。
+   * @returns 回信地址与"是否发生了中继"。
+   */
+  function replyAddress(exec) {
+    const session = exec?.agent?.session
+    const selfId = session?.id === undefined ? '' : String(session.id)
+    const header = session?.header
+    const parentId = typeof header?.parentSession === 'string' ? header.parentSession : ''
+    const isSubagent = header?.origin === 'subagent' && parentId !== '' && parentId !== selfId
+    return { selfId, replyTo: isSubagent ? parentId : selfId, relayed: isSubagent }
+  }
+
   /** 把宿主那条 "owned by subagent routing" 翻译成可操作的提示。 */
   function asDeliveryError(error, sessionId) {
     const message = error instanceof Error ? error.message : String(error)
@@ -925,6 +945,8 @@ function buildTools(api, config) {
           woken: BOOLEAN,
           depth: INTEGER,
           narrow: BOOLEAN,
+          replyTo: STRING,
+          relayed: BOOLEAN,
           compactionRisk: STRING,
           occupancyBefore: { type: 'object', additionalProperties: true },
           projectedAfterPercent: NUMBER,
@@ -937,6 +959,7 @@ function buildTools(api, config) {
             + `messageId=${value.messageId}（读它的答复要用它传 conversation_read 的 messageId）\n`
             + `${value.mode === 'steer' ? '已插进对方当前回合的下一步（它正在跑也能看到）' : '已排到对方本轮结束之后'}`
             + `，本条已带上"来自哪个对话 + 要回时怎么回"\n`
+            + `${value.relayed ? `⚠️ 本会话是子 agent（收不到投递），落款里的回信地址已换成你的父对话 sessionId=${value.replyTo}\n` : ''}`
             + `对方占用${value.occupancyBefore?.percent === undefined ? '未知（该项目标没有可读的占用投影）' : ` ${value.occupancyBefore.percent}%（来源 ${value.occupancyBefore.source}）`}`
             + `${value.projectedAfterPercent === undefined ? '' : `，加上这一条预计 ${value.projectedAfterPercent}%`}`
             + `，compactionRisk=${value.compactionRisk}\n`
@@ -951,7 +974,7 @@ function buildTools(api, config) {
         if (sessionId === '') throw new Error(`${PLUGIN}: conversation_send 需要 sessionId`)
         if (text === '') throw new Error(`${PLUGIN}: conversation_send 需要 text`)
 
-        const senderId = selfSessionId(exec)
+        const { selfId: senderId, replyTo, relayed } = replyAddress(exec)
         const reply = args.reply === true
         // 提问：同对冷却、环路、深度全过；答复：只走深度（护栏不该拦"把结论答回去"）。
         const verdict = api.guard.check(senderId, sessionId, { reply })
@@ -968,8 +991,13 @@ function buildTools(api, config) {
         const bodyText = narrow ? render(config.ask.narrowTemplate, { question: text }) : text
         // 发信人身份必须随消息走：宿主消息模型没有发信人概念（source 只有 kind / rpcId），
         // 收信方唯一的"该回给谁、怎么回"来源就是这段约定。
-        const guide = render(config.ask.replyGuide, { fromSessionId: senderId })
-        const body = `${bodyText}\n${guide}`
+        // 自己是子 agent 时落款地址换成父对话——否则对方照落款回信会被宿主围栏拒（闭环断在这里）。
+        const guide = render(config.ask.replyGuide, { fromSessionId: replyTo })
+        const relayNote = relayed
+          ? `\n[中继说明] 本条由子 agent 会话 sessionId=${senderId} 发出。子 agent 会话收不到投递，`
+            + `所以回信请发给它的父对话 sessionId=${replyTo}（上面落款里的地址就是它，直接照用即可）。`
+          : ''
+        const body = `${bodyText}\n${guide}${relayNote}`
         const messageId = randomUUID()
 
         const occupancyBefore = await host.readPressureById(sessionId, signalOf(exec))
@@ -1002,6 +1030,8 @@ function buildTools(api, config) {
           woken: wake,
           depth: verdict.depth + 1,
           narrow,
+          replyTo,
+          relayed,
           compactionRisk,
           ...(occupancyBefore === undefined ? {} : { occupancyBefore }),
           ...(projected === undefined ? {} : { projectedAfterPercent: projected }),

@@ -590,6 +590,17 @@ assert.deepEqual(inject, ['tools'])
   await assert.rejects(() => send.execute({ sessionId: 'session-bbb', text: 'x' }, asB), /不能给自己发消息/)
   await assert.rejects(() => send.execute({ sessionId: 'session-aaa', text: '   ' }, asB), /需要 text/)
 
+  // 发送方自己是**子 agent 会话**时：落款里的回信地址必须换成它的父对话。
+  // 子 agent 收不到任何投递，照它自己的 sessionId 回信会被宿主围栏拒——真机实测的闭环断点就在这里。
+  const asSub = { agent: { session: { id: 'session-sub', header: { origin: 'subagent', parentSession: 'session-aaa' } } } }
+  const fromSub = await send.execute({ sessionId: 'session-bbb', text: '子 agent 的结论：端口 8099' }, asSub)
+  assert.equal(fromSub.relayed, true, '要标记发生了中继')
+  assert.equal(fromSub.replyTo, 'session-aaa', '回信地址必须是父对话')
+  const subBody = harness.calls.prompt.at(-1).content[0].text
+  assert.match(subBody, /sessionId=session-aaa/, '落款必须指向父对话，否则对方回信必被拒')
+  assert.match(subBody, /\[中继说明\]/, '要说明这条是子 agent 发出的')
+  assert.doesNotMatch(subBody, /回它：用 `conversation_send`（sessionId=session-sub）/, '不能把子 agent 自己当回信地址')
+
   // B 觉得 A 问得不清楚 → 反问 A → A 答回去 → B 再给结论。
   // 反问与新提问走的是同一个动作，区别只在 reply 标记；护栏不该拦这条链。
   const harness3 = createHarness()
