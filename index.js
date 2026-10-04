@@ -1222,10 +1222,23 @@ export function apply(ctx, input = {}) {
     for (const definition of fileTools) ctx.tools.register(definition)
     if (fileTools.length > 0) api.info(`已注册 ${fileTools.length} 个本地工具（无会话服务依赖）`)
 
-    ctx.inject(['sessionController'], (scoped) => {
-      for (const definition of sessionTools) scoped.tools.register(definition)
-      api.info(`sessionController 就绪，已注册 ${sessionTools.length} 个跨对话工具`)
-    })
+    // 两种加载顺序都要覆盖，且不重复注册：
+    //   · 服务已就绪（HMR 重载 / 后加载的插件）→ 立即注册
+    //   · 冷启动时服务后到 → ctx.inject 回调里补注册
+    // 注册一律落在插件自己的 ctx.tools 上（效果归属插件），不依赖 scoped 上下文。
+    const registeredNames = new Set()
+    const registerSessionTools = () => {
+      let added = 0
+      for (const definition of sessionTools) {
+        if (registeredNames.has(definition.name)) continue
+        registeredNames.add(definition.name)
+        ctx.tools.register(definition)
+        added += 1
+      }
+      if (added > 0) api.info(`sessionController 就绪，已注册 ${added} 个跨对话工具`)
+    }
+    if (ctx.get('sessionController') !== undefined) registerSessionTools()
+    ctx.inject(['sessionController'], registerSessionTools)
   }
 
   ctx.logger?.info?.(
