@@ -7,14 +7,26 @@
 首个公开版本。按 `DESIGN.md` 的 v2 设计实现。
 
 ### 取数通道
-- **回问优先**：`conversation_ask` 向另一个对话提问（窄指令 + `askId`），
-  返回事前读数（对方占用、预计压缩风险）；`conversation_read` 用 `askId` 读答复。
-- **可信度是回问的副产品**：`trust` 四态（`clean` / `compacted_by_ask` /
+- **跨对话发消息（唯一管道）**：`conversation_send` 向指定对话塞一条消息，两个方向都走它——
+  提问、回信、反问、只通知。默认 `mode: 'steer'`：**插进对方当前回合的下一步**（对方正在跑也能看到），
+  不是等它整轮输出完再追加；返回 `messageId` 与事前读数（对方占用、预计压缩风险），
+  `conversation_read` 用 `askId=messageId` 读答复。
+  合并前的 `conversation_ask` / `conversation_reply` 已删除（两者在宿主侧是同一个 `prompt`，
+  差别只在信封与护栏；管道只有一条，不该有两个工具名）。
+- **发信人身份随消息走**：宿主消息模型没有发信人概念（`source` 只有 `kind` / `rpcId`），
+  所以每条消息的正文都带一段可配置落款，写明"本条来自哪个对话、要回时用 `conversation_send` 回哪"。
+  少了它，对方就算装了本插件也不知道往哪回。
+- **`answered` 与 `trust` 分工明确**：`answered` 才算"对方答完了"——只有**提问之后**、
+  **不含工具调用**、文本非空的助手帧才算答复；`trust` 只表示表面可不可信。
+  真机事故：对方先落一条 `[工具调用 pwsh]`，旧判定把它当答复还报 `clean`，调用方以为拿到答案了；
+  现在这种情况返回 `answered:false` + `reason:'reply-pending-tool-call'`。
+- **可信度是发消息的副产品**：`trust` 四态（`clean` / `compacted_by_ask` /
   `compacted_earlier` / `unknown`），用 `rpcId` 精确定位"自己问的那一条"来判定窗口，
   不需要事前记游标。
 - **翻旧书回退**：`conversation_outline`（Tier-0 目录）→ `conversation_search`
   （Tier-1 检索，含被压缩掉的工具结果）→ `conversation_read`（`atSeq` 取原文块，Tier-2）。
-  全程只读，**不唤醒对方**。
+  全程只读，**不唤醒对方**。读答复时不使用缓存的游标（`fresh`）——
+  真机事故：答复已落盘 11 秒，read 仍返回旧快照。
 - **交接件自持落盘**：`conversation_handoff_write` 写固定四段（缺段/过短直接拒绝），
   `conversation_handoffs` 读目录页或全文。**不维护索引文件**（目录即索引）。
 - **水位提醒**：上下文占用越阈值时注入一条提醒，指路"写交接件 → 开新对话"，
@@ -57,14 +69,27 @@
   避免把"这段没扫到"误读成"从没压缩过"；`head` 为空时用 checkpoint 正文回填。
 - **交接件回读不再强制带 `cwd`**：写入返回的绝对路径可直接回读（仍拒绝插件目录之外的路径）。
 - **`conversation_list` 渲染带上总数**，被 `limit` 截断时明确提示。
-- **`conversation_ask` / `conversation_read` 渲染补齐**：`accepted` / `askDepth` / 预计占用 /
+- **`conversation_send` / `conversation_read` 渲染补齐**：`accepted` / `depth` / 预计占用 /
   `answered` / `reason` / 定位 seq / 窗口内压缩点 —— 模型只能看到渲染文本，结构化字段必须可读。
 - **`conversation_start` 按 workspace 归组**（见下）：不再落到"未分组"。
 
 ### 修复（第 1 次真机验收后）
 - **冷启动时工具被静默跳过**：`apply` 里用 `ctx.get('sessionController')` 探测可用性，
-  而该服务在应用启动后约 18 秒才就绪 ⇒ 9 个工具一个都没注册（entry 却显示
+  而该服务在应用启动后约 18 秒才就绪 ⇒ 9 个跨对话工具一个都没注册（entry 却显示
   `fiberPhase: active`）。改用 `ctx.inject([...])` 等服务就绪再注册，并让不依赖会话服务的
   本地工具立即注册。
 - `conversation_start` 改为先按工作目录 `resolveByPath` 解析 workspace 再传 `workspaceId`；
   只传 `cwd` 会落到"未分组"。
+
+### 变更（v2 收尾轮：双向管道 + 兜底可用性）
+- **两个工具合并成一个**：`conversation_ask` + `conversation_reply` → `conversation_send`。
+  依据：两者在宿主侧都是 `sessionController.prompt(sessionId, mode, content)`，
+  差别只在信封与护栏；管道只有一条。**不再收"要不要对方回答"这类参数**——
+  回不回是收信人自己的决定（它可能答、可能反问、可能只记下），
+  发信人能表达的只有"怎么投"（`mode` / `wake`）与"正文里想要什么"。
+- **默认投递改为 `steer`（插入）**：原先默认 `queue` 要等对方本轮结束才追加，
+  是"看着像同步、像干等"的一半原因。`steer` 会插进对方当前回合的下一步。
+- **护栏只拦"提问引发提问"的接力**：答复/反问（`reply=true`）不受同对冷却与环路约束，
+  深度上限仍是兜底。B 觉得 A 问得不清楚而反问 A，走的就是同一个工具。
+- **`conversation_start` 开场消息带上交接人 sessionId 与其标题/工作目录**，
+  并写清"要问它/回给它用 `conversation_send`、取答复先看 `answered` 再看 `trust`"。

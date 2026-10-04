@@ -1,6 +1,6 @@
 # dsh-conversation-bridge
 
-> **只管"交接"这一个问题的 DSH 插件。** 把一个对话交给下一个对话，并让下一个对话**能回问、也能翻回原文**。
+> **只管"交接"这一个问题的 DSH 插件。** 把一个对话交给下一个对话，并让下一个对话**能给它发消息/回信、也能翻回原文**。
 >
 > 零第三方依赖 · 不与任何记忆插件集成 · 服务缺失即降级
 
@@ -18,12 +18,12 @@
 
 | 通道 | 拿什么 | 代价 | 定位 |
 |---|---|---|---|
-| **回问** `conversation_ask` | 旧对话**现在综合后**的结论；还能借它的手调度它名下的子 agent | 唤醒 +1 轮，可能触发压缩 | **首选** |
+| **跨对话发消息** `conversation_send` | 旧对话**现在综合后**的结论；还能借它的手调度它名下的子 agent；也能反过来回信/反问它 | 唤醒 +1 轮，可能触发压缩 | **首选** |
 | **翻旧书** `conversation_outline/search/read` | 旧对话**持久日志原文**，含被压缩掉的工具结果与弯路 | **零唤醒**，只烧自己的上下文 | **回退底线** |
 | **交接件** `conversation_handoff_write/handoffs` | 交接时固化下来的四段结论 | 零 | 起点 |
 
-**为什么回问优先仍然安全**：因为可信度是回问的**副产品**——
-`conversation_read` 会告诉你这一问是否把对方推过了压缩线（`trust`），而不是让你盲目相信。
+**为什么发消息优先仍然安全**：因为"答没答完"和"可不可信"都是**副产品**——
+`conversation_read` 用 `answered` 告诉你它答完没有，用 `trust` 告诉你这一问是否把它推过了压缩线，而不是让你盲目相信。
 
 ---
 
@@ -68,8 +68,8 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 |---|---|---|
 | `conversation_list` | ✅ | 列出对话，可按 `parentSessionId` 展开子 agent 子树 |
 | `conversation_context` | ✅ | 占用（token/窗口/百分比）+ 历史压缩点；标注来源 `live`/`cached` |
-| `conversation_ask` | 唤醒 | 回问；返回 `askId`、事前读数、压缩风险 |
-| `conversation_read` | ✅ | 读答复（带 `trust`）／按 `atSeq` 取原文块 |
+| `conversation_send` | 唤醒 | **唯一的管道工具**：提问 / 回信 / 反问 / 只通知；默认插入到对方下一步；返回 `messageId`、事前读数、压缩风险 |
+| `conversation_read` | ✅ | 读答复（先看 `answered` 再看 `trust`）／按 `atSeq` 取原文块 |
 | `conversation_outline` | ✅ | 旧书目录：按轮一行，标压缩点与工具失败 |
 | `conversation_search` | ✅ | 旧书检索：关键词 AND、角色过滤、预算截断 |
 | `conversation_start` | 写 | 开新对话并投递交接件（**唯一开窗入口，不自动开**） |
@@ -81,9 +81,9 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 ```text
 老对话 A：占用到 70% → 插件提醒 → 写交接件 → conversation_start 开新对话 B
 新对话 B：
-  ① conversation_ask(A, "上次那个报错的根因是什么")
-     → conversation_read(A, askId)  → trust=clean 就直接用
-  ② 若 trust=compacted_by_ask（这一问把 A 推过线了）或 A 答不上来：
+  ① conversation_send(A, "上次那个报错的根因是什么")
+     → conversation_read(A, askId=上面的 messageId) → answered=true 且 trust=clean 就直接用
+  ② 若 answered=false（它还在跑/还没答）就稍后再读；若 trust=compacted_by_ask（这一问把 A 推过线了）：
      conversation_outline(A) → conversation_search(A, "EADDRINUSE")
      → conversation_read(A, atSeq=命中位置)  取原文
 ```
@@ -99,7 +99,7 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   config:
     exposeTools: true
     ask:
-      maxDepth: 3              # 回问链最大跳数
+      maxDepth: 3              # 消息链最大跳数（超过就劝去翻旧书）
       pairCooldownMs: 600000   # 同一对会话的最小间隔
       globalPerMinute: 30      # 全局限流
       defaultMode: queue       # queue | steer
@@ -139,7 +139,8 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 - **压缩点可识别**：`compaction/summary` 带 `shadowedRange`，checkpoint 是带
   `surfaceOp:{op:'replace'}` 的 `user/message`；读到 checkpoint 会标成
   `[压缩摘要 seq=N，覆盖 seq=A..B；原文仍可翻]`，避免把摘要误当原始事实。
-- **护栏在插件内**：回问深度、环路、冷却、频率由插件自己维护的有向图推导，**不靠模型传参**。
+- **护栏在插件内**：消息深度、环路、冷却、频率由插件自己维护的有向图推导，**不靠模型传参**；
+  护栏只拦"提问引发提问"的接力，答复/反问（`reply=true`）不受冷却与环路约束。
 
 完整设计与已核验的宿主机制（带证据）见 [`DESIGN.md`](./DESIGN.md)。
 
@@ -152,7 +153,7 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   原样重建。所以想用本插件的工具，请**开一个新对话**——旧对话不会因为重启而获得它们。
 - **启动后约 20 秒内**，`sessionController` 服务尚未就绪，那段时间新建的会话可能看不到
   跨对话的 7 个工具（本地交接件读写不受影响）。
-- 子 agent 会话**不能回问**（宿主归属围栏），只能翻它的日志；要它的活结论请通过它的主对话。
+- 子 agent 会话**不能发消息给它**（宿主归属围栏），只能翻它的日志；要它的活结论请通过它的主对话。
 - 子 agent 会话的**上下文占用可能读不到**（宿主对该投影的限制），此时 `conversation_context`
   会如实报 `available:false`。
 
