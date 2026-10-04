@@ -714,8 +714,9 @@ recentAsks: 环形缓冲（全局频率限制）
 | 2026-10-04 | 建 git 仓库（`main`，首个提交 `09920c5`） | ✅ |
 | 2026-10-04 | **P0 / P1 / P2 / P3 实现并本地验收通过**（`lib/host.js`、`lib/scan.js`、7 个工具） | ✅ 提交 `5f00aca` |
 | 2026-10-04 | **P4 实现并本地验收通过**（`lib/handoff.js` + 2 个工具 + 水位提醒），工具数 7→9 | ✅ 提交待做 |
-| 2026-10-04 | **P5 发布物**：`package.json`（去 `private`）、README / CHANGELOG / LICENSE / icon.svg | ✅ |
-| — | P5 收尾：`install_bundle` + **重启 DSH** + 真机验收 | **未做** |
+| 2026-10-04 | **P5 发布物**：`package.json`（去 `private`）、README / CHANGELOG / LICENSE / icon.svg | ✅ 提交 `d8db545` |
+| 2026-10-04 | `install_bundle` 装到 desktop profile | ✅ 返回 `restart-required`（**运行时仍是 v1，需重启才切到 v2**） |
+| — | **重启 DSH → 真机验收**（9 个工具在册；非空会话能读回原文；子 agent 会话的 `page` 是否可用） | **待办：需要用户重启** |
 
 **测试遗留物（待清理）**：空对话 `bridge-e2e-test`（`session-<省略>`）。
 
