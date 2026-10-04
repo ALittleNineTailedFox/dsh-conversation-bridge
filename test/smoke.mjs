@@ -693,6 +693,27 @@ assert.deepEqual(inject, ['tools'])
   assert.match(body, /conversation_search/)
   assert.match(body, /交接件正文/)
   assert.doesNotMatch(body, /mnemon|memorySinks|记忆插件/, '绝不能提及任何记忆插件')
+  assert.equal(value.relayed, false, '普通对话开窗不发生中继')
+  assert.equal(value.contactSessionId, 'session-aaa')
+
+  // 发起开窗的本身是**子 agent 会话**：接力头里的回信地址必须换成它的父对话，
+  // 否则新对话照接力头回信会被宿主围栏拒（子 agent 会话收不到投递）
+  const subExec = {
+    agent: {
+      session: {
+        id: 'session-sub',
+        header: { cwd: '<工作区>', origin: 'subagent', parentSession: 'session-aaa', agentPreset: 'code' },
+      },
+    },
+  }
+  const subStart = await tools.get('conversation_start').execute({ title: '子-agent 交接', message: '交接件正文' }, subExec)
+  assert.equal(subStart.relayed, true, '要标记发生了中继')
+  assert.equal(subStart.parentSessionId, 'session-sub', '交接人仍如实记为发起者')
+  assert.equal(subStart.contactSessionId, 'session-aaa', '回信地址必须是父对话')
+  const subBody = harness.calls.prompt.at(-1).content[0].text
+  assert.match(subBody, /sessionId=`session-aaa`/, '接力头回信地址必须是父对话')
+  assert.match(subBody, /子 agent 会话/, '要说明为什么地址不是它自己')
+  assert.doesNotMatch(subBody, /conversation_send`（sessionId=`session-sub`）/, '不能把子 agent 自己当回信地址')
 
   // 解析不到 workspace（目录未登记 / 没有 registry）→ 退回只给 cwd，且如实报告未分组
   const loose = createHarness({ noWorkspaceRegistry: true })

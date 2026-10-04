@@ -426,6 +426,8 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 开场消息 = [接力头] + 用户给的 message
 接力头自动包含：
   · **交接人（上一段对话）的 sessionId** + 它的标题/工作目录（标题查本对话自己的，不拿新对话的 title 顶上）
+  · **回信地址取"收得到"的那个**：发起开窗的若本身是子 agent 会话，接力头里给的是它的**父对话**
+    （子 agent 会话不接受投递），并注明缘由；返回里 `relayed` / `contactSessionId` 如实报告
   · 本次交接件文件路径 + 交接件目录的用法
   · 管道用法：「要问它/回给它用 `conversation_send`（sessionId 指对方；答复类传 reply=true）」
   · 取答复用法：「`conversation_read`（messageId=上一步的 messageId），**先看 answered 再看 trust**」

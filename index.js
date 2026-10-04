@@ -1074,6 +1074,8 @@ function buildTools(api, config) {
           grouped: BOOLEAN,
           title: STRING,
           parentSessionId: STRING,
+          contactSessionId: STRING,
+          relayed: BOOLEAN,
           messageSent: BOOLEAN,
           note: STRING,
         }),
@@ -1082,13 +1084,18 @@ function buildTools(api, config) {
           text: `已开启新对话 sessionId=${value.sessionId}${value.cwd ? `（cwd=${value.cwd}）` : ''}`
             + `${value.grouped ? `，已归入分组 workspaceId=${value.workspaceId}` : '（**未归入任何分组，会显示在"未分组"里**）'}。`
             + `${value.messageSent ? '开场消息已发送。' : '尚未发送任何消息。'}`
-            + `${value.parentSessionId ? ` 它可以用 conversation_send(sessionId=${value.parentSessionId}) 回信给本对话。` : ''}`,
+            + `${value.contactSessionId ? ` 它可以用 conversation_send(sessionId=${value.contactSessionId}) 回信给本对话。` : ''}`
+            + `${value.relayed ? '（本会话是子 agent，收不到投递，所以地址给的是它的父对话。）' : ''}`,
         }],
       },
       async execute(args, exec) {
         requireHost()
         const session = exec?.agent?.session
-        const parentSessionId = session?.id === undefined ? '' : String(session.id)
+        // 发起开窗的若本身是子 agent 会话，接力头/返回值里的"回信地址"要换成它的父对话
+        const opener = replyAddress(exec)
+        const parentSessionId = opener.selfId
+        const contactSessionId = opener.replyTo
+        const relayed = opener.relayed
         const parentCwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
         const parentPreset = typeof session?.header?.agentPreset === 'string' ? session.header.agentPreset : ''
 
@@ -1144,6 +1151,8 @@ function buildTools(api, config) {
         if (body !== '') {
           const header = parentSessionId === '' ? '' : renderHandoffHeader({
             parentSessionId,
+            contactSessionId,
+            relayed,
             parentTitle,
             parentCwd,
             handoffFile: readText(args.handoffFile, ''),
@@ -1175,8 +1184,10 @@ function buildTools(api, config) {
           grouped: workspaceId !== '',
           title,
           parentSessionId,
+          contactSessionId,
+          relayed,
           messageSent,
-          note: '交接人 sessionId 已写进开场消息：它可以用 conversation_send 回信给本对话，也能用 conversation_outline/search/read 翻本对话的日志。',
+          note: '接力头已写进开场消息：它可以用 conversation_send 回信给"收得到投递的那个地址"（发起方是子 agent 时即其父对话），也能用 conversation_outline/search/read 翻本对话的日志。',
         }
       },
     }),
@@ -1357,9 +1368,16 @@ function renderPointLine(point) {
 }
 
 function renderHandoffHeader(vars) {
+  // 回信地址必须是"收得到"的那个：发起开窗的若是子 agent 会话，它收不到投递，
+  // 接力头里就得把地址换成它的父对话，否则新对话照接力头回信必被宿主围栏拒。
+  const contact = vars.contactSessionId === undefined ? vars.parentSessionId : vars.contactSessionId
+  const relayNote = vars.relayed === true
+    ? `\n  （注意：发起这次交接的是一个**子 agent 会话** sessionId=\`${vars.parentSessionId}\`，它收不到投递；` +
+      `所以上面地址给的是它的父对话——回信发到那里。）`
+    : ''
   return `[接力对话] 这是一段由交接产生的新对话，接替上一段对话。
 - 交接人（上一段对话）sessionId = \`${vars.parentSessionId}\`${vars.parentTitle ? `（标题：${vars.parentTitle}）` : ''}${vars.parentCwd ? `，工作目录：${vars.parentCwd}` : ''}
-${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conversation_handoffs 传 file 再读一遍）\n` : ''}- **要问它/回给它**：用 \`conversation_send\`（sessionId=\`${vars.parentSessionId}\`）把话塞过去，默认插到它的下一步；
+${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conversation_handoffs 传 file 再读一遍）\n` : ''}- **要问它/回给它**：用 \`conversation_send\`（sessionId=\`${contact}\`）把话塞过去，默认插到它的下一步；${relayNote}
   它是答复（不是新提问）时传 reply=true。它回不回由它决定，你要的东西写进正文。
 - **取它的结论**：\`conversation_read\`（sessionId + messageId=上一步返回的那个 id）读答复；**先看 answered（答完没），再看 trust**：
   - \`answered:false\` → 它还没答完（可能在跑工具），稍后再读，别当成"它答了个空"；
