@@ -22,8 +22,10 @@
 | **翻旧书** `conversation_outline/search/read` | 旧对话**持久日志原文**，含被压缩掉的工具结果与弯路 | **零唤醒**，只烧自己的上下文 | **回退底线** |
 | **交接件** `conversation_handoff_write/handoffs` | 交接时固化下来的四段结论 | 零 | 起点 |
 
-> 跨对话消息在对方日志里是 `user` 角色（宿主限制），所以本插件给投递的 `rpcId` 加 `bridge-` 前缀：
-> 装了本插件的收信方据此把它识别为「插件输入」，不会误当成真人插话而把 `trust` 打成 `unknown`。
+> 跨对话消息在日志里是 **user 角色**（模型侧本来就得这样），但**来源由本插件声明**
+> （`agent-message` 中继 / 本插件的 `notice`）：**认这个声明的宿主**会在界面里渲染成
+> "来自会话 X 的中继消息"或一行注入提示，不再像用户自己说的话；**不认的宿主**忽略该字段，
+> 此时靠 `bridge-` 前缀让装了本插件的收信方仍能识别出「这是插件发的」，不会把 `trust` 打成 `unknown`。
 **为什么发消息优先仍然安全**：因为"答没答完"和"可不可信"都是**副产品**——
 `conversation_read` 用 `answered` 告诉你它答完没有，用 `trust` 告诉你这一问是否把它推过了压缩线，而不是让你盲目相信。
 
@@ -70,11 +72,11 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 |---|---|---|
 | `conversation_list` | ✅ | 列出对话，可按 `parentSessionId` 展开子 agent 子树 |
 | `conversation_context` | ✅ | 占用（token/窗口/百分比）+ 历史压缩点；标注来源 `live`/`cached` |
-| `conversation_send` | 唤醒 | **唯一的管道工具**：提问 / 回信 / 反问 / 只通知；默认插入到对方下一步；返回 `messageId`、事前读数、压缩风险 |
+| `conversation_send` | 唤醒 | **唯一的管道工具**：提问 / 回信 / 反问 / 只通知；默认插入到对方下一步；返回 `messageId`、事前读数、压缩风险。**只能发给交接双方**（你拉起的对话 / 拉起你的对话） |
 | `conversation_read` | ✅ | 读答复（先看 `answered` 再看 `trust`）／按 `atSeq` 取原文块 |
 | `conversation_outline` | ✅ | 旧书目录：按轮一行，标压缩点与工具失败 |
 | `conversation_search` | ✅ | 旧书检索：关键词 AND、角色过滤、预算截断 |
-| `conversation_start` | 写 | 开新对话并投递交接件（**唯一开窗入口，不自动开**） |
+| `conversation_start` | 写 | 开新对话并投递交接件（**唯一开窗入口，不自动开**；它记下"交接双方"这条边，之后两边才能互投） |
 | `conversation_handoffs` | ✅ | 交接件目录页／全文 |
 | `conversation_handoff_write` | 写 | 写交接件（固定四段，缺段或过短会被拒） |
 
@@ -126,6 +128,9 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
       dir: ""                  # 空 = <会话 cwd>/.dsh-conversation-bridge/handoffs/
       minSectionChars: 40      # 每段最小长度，不达标拒绝写入
       sections: ["任务状态", "目标", "已试方案与失败原因", "进度与下一步"]
+    lineage:
+      file: ""                 # 交接关系账；空 = ~/.dsh-conversation-bridge/lineage.json
+      limit: 200               # 最多保留多少条"谁开了谁"的边
 ```
 
 ---
@@ -140,8 +145,12 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   `surfaceOp:{op:'replace'}` 的 `user/message`；读到 checkpoint 会标成
   `[压缩摘要 seq=N，覆盖 seq=A..B；原文仍可翻]`，避免把摘要误当原始事实。
 - **只做防呆，不设门禁**：跨对话发消息是一条**纯管道**（对标宿主自己的 `send_message`）——
-    没有冷却、没有环路检测、没有深度上限。任意多轮协作都畅通；只留一个全局频率（每分钟 30 条）
-    挡代码死循环。防滥用交给调用方的判断与你在界面上的可视干预。
+  没有冷却、没有环路检测、没有深度上限；只留一个全局频率（每分钟 30 条）挡代码死循环。
+  **另有一条产品边界**（不是护栏）：投递范围只限交接双方（[`DESIGN.md`](./DESIGN.md) §7.4），
+  边内双向、不限轮数，全部畅通。
+- **投递范围由插件自己的关系账判定**（`lib/lineage.js`）：宿主不记录普通会话的派生关系
+  （`sessionController.create` 落盘的 meta 只有 cwd/preset），所以 `conversation_start` 成功时记一条边，
+  投递前查一次（双向）。只记关系不记内容；账本删了不丢东西，只是边要重建。
 
 完整设计与已核验的宿主机制（带证据）见 [`DESIGN.md`](./DESIGN.md)。
 
@@ -181,11 +190,11 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 ## 开发
 
 ```sh
-node test/smoke.mjs   # 20 组断言，假宿主，忠实复刻宿主 paginate 与子 agent 围栏语义
+node test/smoke.mjs   # 24 组断言，假宿主，忠实复刻宿主 paginate 与子 agent 围栏语义
 ```
 
 零依赖、无构建步骤：`lib/host.js`（只读宿主适配）、`lib/scan.js`（纯函数扫描）、
-`lib/handoff.js`（交接件落盘）、`index.js`（配置 + 工具 + 装配）。
+`lib/handoff.js`（交接件落盘）、`lib/lineage.js`（交接关系账）、`index.js`（配置 + 工具 + 装配）。
 
 ## License
 
