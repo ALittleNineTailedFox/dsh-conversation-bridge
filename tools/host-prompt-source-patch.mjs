@@ -21,7 +21,8 @@ import { join, resolve } from 'node:path'
 
 const PACKAGE_PATH = join('node_modules', '@deepseek-ai', 'dsh-api-session-controller', 'lib')
 const DEFAULT_APP = 'D:\\software\\DSH Desktop\\resources\\app'
-const DEFAULT_FROM = 'D:\\project\\dsh\\deepseek-harness-0.2.0-rc.2\\packages\\api\\session-controller\\lib'
+// 已打补丁的构建产物（不再依赖 harness worktree：那边的源码已按用户要求回退到 tag，只剩这份产物）
+const DEFAULT_FROM = 'D:\\project\\dsh\\dsh-host-patch-0.2.0-rc.2'
 const BACKUP_SUFFIX = '.bridge-orig'
 
 /** 只在原始构建里出现：`prompt` 里写死的 user 来源。 */
