@@ -764,15 +764,18 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
 `subagents.followup` 只对"自己的子 agent"有效；`agent.inject` 只对热会话有效且不唤醒模型。
 
 
-**上游路径（未做，属于"治本链路"）**：
+**上游与官方仓（用户 2026-10-05 拍板：不推上游、不动官方仓）**：
 
-1. 源码改动已落在 harness worktree `<工作区>\dsh\deepseek-harness-0.2.0-rc.2`
-   （分支 `fix/session-prompt-declared-source`，提交 `1d00742e15`），含单元测试、双语 README、Agent Note。
-2. 要进上游需按该仓流程提 PR；要进本机 Desktop 则必须重打包（`resources/app` 是打包产物）。
-3. **本机现在的做法**：把重建出来的 `lib/index.js` + `lib/typert.host.js` 拷进已安装的
-   `resources/app/node_modules/@deepseek-ai/dsh-api-session-controller/lib/`，
-   原文件留 `.bridge-orig` 备份；`tools/host-prompt-source-patch.mjs` 可重放/回退。
-   **DSH Desktop 升级会覆盖掉这个补丁**，届时重跑一次脚本即可（脚本会先核对标记再动手）。
+1. harness 的源码改动曾落在 worktree `<工作区>\dsh\deepseek-harness-0.2.0-rc.2`（提交 `1d00742e15`，含单元测试、
+   双语 README、Agent Note），**按用户要求已回退**（worktree 回到 tag `dsh-v0.2.0-rc.2`，分支已删）。
+   我**不提 PR、不改官方仓**，这个能力缺口等官方自己修。
+2. **本机现在的做法（保留）**：把已打补丁的 `lib/index.js` + `lib/typert.host.js` 拷进已安装的
+   `resources/app/node_modules/@deepseek-ai/dsh-api-session-controller/lib/`，原文件留 `.bridge-orig` 备份。
+3. 补丁产物与重放工具（**不依赖 worktree**）：
+   - 产物目录：`<工作区>\dsh\dsh-host-patch-0.2.0-rc.2\`（两个文件 + README.txt）
+   - 源码补丁（留档）：`<工作区>\dsh\fix-session-prompt-declared-source.patch`
+   - 重放/回退：`node tools/host-prompt-source-patch.mjs status|apply|revert`
+   **DSH Desktop 升级会覆盖掉这个补丁**，届时重跑一次 `apply` 即可（脚本会先核对标记再动手）。
 
 ### 7.4 投递范围：只服务交接链（2026-10-05 新增）
 
@@ -926,7 +929,8 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
 | 2026-10-04 | **第 4 次重启 → 复验最后 2 项：全部通过** | ✅ 功能完工 |
 | 2026-10-04 | 水位提醒在**本对话自身**触发两次（70.0% / 71.5%），并暴露"提醒让模型调一个本会话不可见的工具"⇒ 文案改为工具无关的兜底写法 | ✅ 真机验证 |
 | 2026-10-05 | **投递回归纯管道**：删掉冷却/环路/深度与 `reply` 参数（§7） | ✅ 提交 `2487fa8` |
-| 2026-10-05 | **投递来源声明**：插件侧声明 `agent-message`/`notice`；harness 源码改动 + 测试 + Agent Note 落在 worktree 分支（提交 `1d00742e15`） | ✅ 插件侧已实现并本地验收 |
+| 2026-10-05 | **投递来源声明**：插件侧声明 `agent-message`/`notice`；宿主侧靠本机补丁（harness 源码改动已在用户要求下回退，不推上游） | ✅ 插件侧已实现；真机复核通过 |
+| 2026-10-05 | **公开仓迁到新账号**：`github.com/ALittleNineTailedFox/dsh-conversation-bridge`（旧仓已删）；全部 29 个提交重写为新身份 | ✅ 已推送新仓 |
 | 2026-10-05 | **本机宿主补丁**：把重建的 `lib/index.js` + `lib/typert.host.js` 拷进已安装 Desktop（原文件留 `.bridge-orig`） | ✅ 重启后真机复核通过：日志里投递 source = `agent-message`，GUI 渲染成"收到任务消息"卡片（不是用户气泡） |
 | 2026-10-05 | **投递范围收紧到交接链**（§7.4）：`conversation_start` 记交接边，`conversation_send` 只放行交接双方；只读不受限 | ✅ 已实现并真机复核（向无关对话投递被拒） |
 | 2026-10-05 | **事故**：公开仓提交身份泄漏（真名 + JD 邮箱进历史）→ 重写 28 个提交为 GitHub noreply 并强推 | ✅ 已修；GitHub 侧仍可按旧 SHA 取到旧提交，是否彻底清除待用户定 |
