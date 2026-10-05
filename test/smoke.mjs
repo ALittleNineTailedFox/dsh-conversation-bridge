@@ -461,6 +461,7 @@ assert.deepEqual(inject, ['tools'])
   // 发信人身份必须随消息走：宿主不提供发信人概念，收信方唯一来源就是这段约定
   assert.match(harness.calls.prompt.at(-1).content[0].text, /sessionId=session-bbb/, '正文必须写明这条来自哪个对话')
   assert.match(harness.calls.prompt.at(-1).content[0].text, /conversation_send/, '正文必须写明回信方法')
+  assert.match(harness.calls.prompt.at(-1).content[0].text, /reply=true/, '落款必须明确要求答复时传 reply=true——漏传会被当成新提问，撞环路护栏（真机撞到过）')
   assert.equal(askedClean.compactionRisk, 'likely', '对方已在 80% → 事前就要预警')
   assert.equal(askedClean.occupancyBefore.source, 'cached')
   assert.match(askedClean.messageId, /^bridge-/, '跨对话投递的 rpcId 必须带桥前缀（收信侧靠它识别"这是插件发的"）')
@@ -551,7 +552,14 @@ assert.deepEqual(inject, ['tools'])
   await assert.rejects(() => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: 'q' }, asB), /不能给自己发消息/)
 
   await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '第一次' }, asB)
-  await assert.rejects(() => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '回信回来' }, asA), /环路/)
+  // 环路被拒时，错误里必须点明出路：如果你是在答复，传 reply: true
+  await assert.rejects(
+    () => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '回信回来' }, asA),
+    (error) => /环路/.test(error.message) && /reply: true/.test(error.message),
+  )
+  // 但同一场景传 reply: true 就必须放行（答复不受环路约束）
+  const cycled = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '这是我的答复', reply: true }, asA)
+  assert.equal(cycled.accepted, true, '答复必须能穿过环路护栏')
 
   // 深度：maxDepth=0 时任何回问都超限
   const shallow = createHarness()

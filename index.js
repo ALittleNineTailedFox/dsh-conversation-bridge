@@ -48,22 +48,19 @@ const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不�
 问题：{{question}}`
 
 /**
- * 每一条跨对话消息都要带的"发信人 + 回信方法"。
- *
- * 宿主的消息模型里**没有发信人概念**（`source` 只有 `kind` 与 `rpcId`），
- * 所以收信方不可能从消息本身知道是谁发的、该回给谁——只能由插件把这段约定写进正文。
- * 少了这段，对方就算装了本插件也不知道回信给哪个 sessionId（真机第一次复验就撞到这个）。
- */
-/**
  * 每一条跨对话消息都带的落款。
  *
  * 不判断"对方该不该回"——那是收信人自己的决定（它可能答、可能反问、可能只记下）。
- * 落款只负责两件事：说明这条来自哪个对话；告诉对方要回时用哪个工具、往哪回。
+ * 落款负责三件事：说明这条来自哪个对话；告诉对方要回时用哪个工具、往哪回；
+ * **并明确要求答复时传 `reply=true`**——漏传会被当成新提问：轻则被包上窄指令，
+ * 重则撞环路护栏（对方问过你时，你的回信会被直接拒）。真机实测撞到过 B 漏传。
  */
 const DEFAULT_REPLY_GUIDE = `
 ---
 [对话间消息] 本条由对话 sessionId={{fromSessionId}} 通过 ${PLUGIN} 发来。
-- 你要回它：用 \`conversation_send\`（sessionId={{fromSessionId}}）把话发回去（默认插到它的下一步）。`
+- 你要回它：用 \`conversation_send\`（sessionId={{fromSessionId}}，**reply=true**）把话发回去。
+  reply=true 表示"这是答复"：不包窄指令，也不受"刚问过这个对话"的冷却与环路约束。
+  **漏传 reply=true 会被当成新提问**——对方问过你时，你的回信会被环路护栏直接拒。`
 
 const DEFAULT_REMINDER = `<context_handoff level="warning">
 ⚠️ 本对话上下文已用到 {{percent}}%（约 {{tokens}} / {{window}} tokens，阈值 {{threshold}}%）。
@@ -343,7 +340,13 @@ function createGuard(config) {
     }
     if (options.reply === true) return { ok: true, depth }
     if (reaches(targetId, askerId)) {
-      return { ok: false, reason: 'cycle', message: '检测到消息环路（这条链上已经有人在互相要答复）。请改为翻旧书。' }
+      return {
+        ok: false,
+        reason: 'cycle',
+        message: '检测到消息环路（这条链上已经有人在互相要答复）。'
+          + '**如果你是在答复对方**（而不是新提问），传 `reply: true` 再发一次即可——答复不受环路约束；'
+          + '确实是新提问就请改为翻旧书（conversation_outline / conversation_search / conversation_read）。',
+      }
     }
     const pairKey = `${askerId}\u0000${targetId}`
     const last = lastAskAt.get(pairKey) ?? 0
@@ -353,7 +356,8 @@ function createGuard(config) {
         ok: false,
         reason: 'cooldown',
         waitMs,
-        message: `刚问过这个对话，请等 ${Math.ceil(waitMs / 1000)} 秒再问；期间可以先翻旧书。`,
+        message: `刚问过这个对话，请等 ${Math.ceil(waitMs / 1000)} 秒再问；期间可以先翻旧书。`
+          + '（**如果你是在答复对方**，传 `reply: true` 即可，答复不受同对冷却约束。）',
       }
     }
     const now = Date.now()
