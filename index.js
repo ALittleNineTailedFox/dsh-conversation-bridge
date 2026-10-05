@@ -14,6 +14,7 @@
 import { randomUUID } from 'node:crypto'
 import { createHost, idleSignal, signalOf } from './lib/host.js'
 import { DEFAULT_SECTIONS, listHandoffs, readHandoff, resolveDir, writeHandoff } from './lib/handoff.js'
+import { createLineage } from './lib/lineage.js'
 import {
   BRIDGE_RPC_PREFIX,
   assessTrust,
@@ -154,6 +155,11 @@ const DEFAULTS = Object.freeze({
     inheritPreset: true,
     reminderText: DEFAULT_REMINDER,
   }),
+  lineage: Object.freeze({
+    // 交接关系账（谁开了谁）。空 = ~/.dsh-conversation-bridge/lineage.json。
+    file: '',
+    limit: 200,
+  }),
 })
 
 /* ------------------------------------------------------------------ *
@@ -195,6 +201,7 @@ export function resolveConfig(input) {
   const askRaw = isRecord(raw.ask) ? raw.ask : {}
   const archiveRaw = isRecord(raw.archive) ? raw.archive : {}
   const handoffRaw = isRecord(raw.handoff) ? raw.handoff : {}
+  const lineageRaw = isRecord(raw.lineage) ? raw.lineage : {}
   const threshold = readRatio(handoffRaw.threshold, DEFAULTS.handoff.threshold)
   // 重新武装的线必须严格低于阈值，否则"超过阈值"与"回落"同时成立，提醒会被反复触发。
   const rearmBelow = Math.max(0, Math.min(
@@ -238,6 +245,10 @@ export function resolveConfig(input) {
       inheritCwd: readBoolean(handoffRaw.inheritCwd, DEFAULTS.handoff.inheritCwd),
       inheritPreset: readBoolean(handoffRaw.inheritPreset, DEFAULTS.handoff.inheritPreset),
       reminderText: readText(handoffRaw.reminderText, DEFAULTS.handoff.reminderText),
+    },
+    lineage: {
+      file: typeof lineageRaw.file === 'string' ? lineageRaw.file.trim() : DEFAULTS.lineage.file,
+      limit: readInteger(lineageRaw.limit, DEFAULTS.lineage.limit, 1, 5000),
     },
   }
 }
@@ -418,6 +429,32 @@ function buildTools(api, config) {
   function asDeliveryError(error, sessionId) {
     const message = error instanceof Error ? error.message : String(error)
     return /owned by subagent routing/i.test(message) ? subagentHeldError(sessionId) : error
+  }
+
+  /**
+   * 投递范围的产品边界：**本插件只服务交接链**。
+   *
+   * 允许的只有**直接交接边**上的两个对话：你（或你的父对话）`conversation_start` 拉起过它，
+   * 或它拉起过你（或你的父对话）。其余一律拒——这不是防滥用的护栏，是"这个插件是干什么的"：
+   * 没有交接关系的两个对话之间不存在业务诉求（真要给无关对话递东西，那是另一个工具的事）。
+   *
+   * 判定用**回信地址**（`replyTo`）而不是原始 selfId：发送方是子 agent 会话时，能收投递的是它的父对话，
+   * 交接边也是记在父对话名下的（见 conversation_start）。
+   * @returns 通过时什么都不返回；不通过时抛可操作的话术。
+   */
+  async function assertHandoffEdge(from, to) {
+    if (await api.lineage.has(from, to)) return
+    throw new Error(
+      `${PLUGIN}: 拒绝投递——本插件只做**交接**，只能和交接双方通信。\n`
+      + `你这边（可收投递的地址）sessionId=\`${from}\`，目标 sessionId=\`${to}\`，两者之间没有交接关系。\n`
+      + '可行的做法：\n'
+      + '① 从你这边用 `conversation_start` 开一个新对话，把要交接的内容（交接件）交给它——'
+      + '那条边会被记下来，之后你们就能互相投递；\n'
+      + '② 只读不受限制：`conversation_read` / `conversation_outline` / `conversation_search` / '
+      + '`conversation_context` / `conversation_list` 依然可以读任意对话（只读不打扰对方）。\n'
+      + '③ 若这个目标本来是你的交接对方（比如重启前开过窗），检查交接关系账是否被清掉了：'
+      + `${api.lineage.file}`,
+    )
   }
 
   /** 把"读一页/翻多页"统一成事件数组，并守住扫描预算。 */
@@ -914,7 +951,9 @@ function buildTools(api, config) {
     tool({
       name: 'conversation_send',
       description:
-        '把一条消息塞给指定对话，两个方向都走这一个工具。'
+        '把一条消息塞给**交接对方**，两个方向都走这一个工具。'
+        + '**只能发给交接双方**：你用 conversation_start 拉起的对话，或拉起你的那个对话'
+        + '（本插件只做交接，给无关对话发消息会被拒绝；只读工具不受限）。'
         + '默认 mode=steer：**插进对方当前回合的下一步**（对方正在思考/跑工具也能看到），不是等它整轮输出完再追加；'
         + '要等它本轮结束再排，显式传 mode=queue。它空闲时这一条会把它唤醒走一轮。'
         + '你要什么写在 text 里（提问、要结论、通知、或"不用再回我"）——**它回不回、怎么回是它自己的决定**，'
@@ -926,7 +965,7 @@ function buildTools(api, config) {
         additionalProperties: false,
         required: ['sessionId', 'text'],
         properties: {
-          sessionId: { type: 'string', description: '要塞给哪个对话（交接时对方给你的 sessionId，或 conversation_list 里查到的）' },
+          sessionId: { type: 'string', description: '交接对方的 sessionId（你用 conversation_start 拉起的那个，或拉起你的那个）' },
           text: { type: 'string', description: '要说的话：问题、要它给的结论、进度、或"不用再回我"' },
           narrow: { type: 'boolean', description: '是否把内容包成窄指令（默认 true：只回答、不复盘、不展开、不重做）。发答复或长内容时传 false' },
           mode: { type: 'string', enum: ['steer', 'queue'], description: 'steer=插进对方当前回合的下一步（默认）；queue=等对方本轮结束再排' },
@@ -978,8 +1017,10 @@ function buildTools(api, config) {
         const requestedMode = args.mode === 'queue' ? 'queue' : (args.mode === 'steer' ? 'steer' : config.ask.defaultMode)
         // wake:false 只能用 queue 投递：steer 的语义就是"唤醒它当前回合的下一步"
         const mode = wake ? requestedMode : 'queue'
-        // 目标由子 agent 路由持有 → 宿主必拒；提前报清楚并给退路
+        // 目标由子 agent 路由持有 → 宿主必拒；提前报清楚并给退路（这条比"有没有交接关系"更硬，先判）
         await assertDeliverable(sessionId, exec)
+        // 产品边界：只和交接双方通信（见 assertHandoffEdge）
+        await assertHandoffEdge(replyTo, sessionId)
         // 提问才包窄指令；答复本身就是内容，包上反而啰嗦
         const narrow = args.narrow !== false && config.ask.narrow
         const bodyText = narrow ? render(config.ask.narrowTemplate, { question: text }) : text
@@ -1046,6 +1087,8 @@ function buildTools(api, config) {
       name: 'conversation_start',
       description:
         '开启一个全新的 DSH 对话并可选地把第一条消息发进去（交接时把交接件全文放进来）。'
+        + '它会成为你的**交接对方**：之后你们双向都能用 conversation_send 互相发消息（本插件只服务交接链，'
+        + '和无关对话之间不能互相投递）。'
         + '新对话会出现在对话列表里并独立运行；开场消息自动带上"上一段对话是谁、怎么回给它、怎么翻旧书"。'
         + '默认归入**当前对话所在的分组**（workspace）；只给 cwd 会落到"未分组"，所以优先按工作目录解析 workspace。'
         + '阈值提醒只负责提醒，开窗由你或用户决定。',
@@ -1120,6 +1163,16 @@ function buildTools(api, config) {
         if (agentPreset !== '') request.agentPreset = agentPreset
         const created = await api.sessionController.create(request)
         const sessionId = String(created.sessionId)
+        // 记下这条交接边（谁开了谁）：投递范围只认交接双方，见 lib/lineage.js。
+        // 用 contactSessionId（可收投递的地址）而不是原始 selfId——子 agent 开窗时边记在父对话名下。
+        if (contactSessionId !== '') {
+          try {
+            await api.lineage.record(contactSessionId, sessionId)
+          } catch (error) {
+            // 账本写不进去不能让开窗失败，但必须说出来：否则之后投递会被自己的门禁拒掉
+            api.warn(`交接关系记录失败（之后的投递可能被判为无交接关系）：${String(error)}`)
+          }
+        }
 
         const title = readText(args.title, '')
         if (title !== '') {
@@ -1436,6 +1489,12 @@ export function apply(ctx, input = {}) {
   const config = resolveConfig(input)
   const host = createHost(ctx)
   const guard = createGuard(config)
+  // 交接关系账（谁开了谁）：投递范围的产品边界靠它判定，见 lib/lineage.js 与 DESIGN §7.4
+  const lineage = createLineage({
+    file: config.lineage.file,
+    limit: config.lineage.limit,
+    logger: { warn: (message) => { try { ctx.logger?.warn?.(`${PLUGIN}: ${message}`) } catch { /* 日志失败不影响功能 */ } } },
+  })
 
   /* ---- 每会话的提醒状态（进程内，不持久化） ---- */
   const handoffStates = new Map()
@@ -1452,6 +1511,7 @@ export function apply(ctx, input = {}) {
   const api = {
     host,
     guard,
+    lineage,
     config,
     get sessionController() {
       return ctx.get('sessionController')

@@ -167,6 +167,14 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   本机让宿主认这个声明需要打一次宿主补丁，见 `DESIGN.md` §7.3 与 `tools/host-prompt-source-patch.mjs`。
 - **`conversation_start` 的首条消息仍然是"用户消息"**（故意）：那是"用户开了一个新对话并贴进交接件"，
   会话标题与列表排序都依赖它是一条用户提示词。
+- **投递范围只限交接双方**（产品边界，见 `DESIGN.md` §7.4）：`conversation_send` 只能发给
+  "你用 `conversation_start` 拉起的对话"或"拉起你的那个对话"；与无关对话互投会被拒绝（两个方向都拒）。
+  **只读工具不受限**——`conversation_read` / `outline` / `search` / `context` / `list` 依然能读任意对话
+  （边界只画在"投递"上：投递会打扰对方、耗对方上下文；读不会）。
+  - 交接关系记在插件自己的账本里（默认 `~/.dsh-conversation-bridge/lineage.json`，配置项 `lineage.file`），
+    `conversation_start` 成功时自动记一条边。
+  - **升级到本版本之前的旧搭档之间没有这条边**：第一次投递会被拒；按错误话术用 `conversation_start`
+    再开一次窗即可，或手工往账本里补一条 `{"opener":"session-a","child":"session-b","at":0}`。
 
 ---
 

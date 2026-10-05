@@ -76,3 +76,12 @@
           minSectionChars: 40
           # 渲染用的四段标题（顺序即契约顺序，请勿增删）
           sections: ["任务状态", "目标", "已试方案与失败原因", "进度与下一步"]
+
+        # ---- 交接关系账（投递范围的产品边界）----
+        # 宿主对**普通会话**不记录"B 是 A 建出来的"，所以"谁开了谁"由插件在 conversation_start
+        # 成功时自己记一笔；conversation_send 只允许发往交接双方，其余一律拒（见 DESIGN §7.4）。
+        lineage:
+          # 账本文件；空 = ~/.dsh-conversation-bridge/lineage.json
+          file: ""
+          # 最多保留多少条边（超出丢最旧）
+          limit: 200

@@ -763,6 +763,7 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
 **为什么需要宿主改动而不能纯插件解决**：`sessionController` 暴露的投递入口只有 `prompt`，而它写死来源；
 `subagents.followup` 只对"自己的子 agent"有效；`agent.inject` 只对热会话有效且不唤醒模型。
 
+
 **上游路径（未做，属于"治本链路"）**：
 
 1. 源码改动已落在 harness worktree `<工作区>\dsh\deepseek-harness-0.2.0-rc.2`
@@ -772,6 +773,34 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
    `resources/app/node_modules/@deepseek-ai/dsh-api-session-controller/lib/`，
    原文件留 `.bridge-orig` 备份；`tools/host-prompt-source-patch.mjs` 可重放/回退。
    **DSH Desktop 升级会覆盖掉这个补丁**，届时重跑一次脚本即可（脚本会先核对标记再动手）。
+
+### 7.4 投递范围：只服务交接链（2026-10-05 新增）
+
+**这是产品边界，不是防滥用护栏。** 本插件的问题域就是"交接"：A 写交接件 → 拉起 B → A 与 B 互相问。
+所以 `conversation_send` **只允许发往交接双方**：
+
+> 允许发送 ⟺ caller（或它的父对话）与 target 之间存在**直接交接边**：一方用 `conversation_start` 拉起过另一方。
+
+- A↔B ✅、B↔C ✅（B 拉起 C）、A↔C ❌、任意无关对话 ❌（两个方向都拒）。
+- **方向完全对称**：同一条边两个方向都通，且不限轮数——这条不能变（§4.1/§7 的多轮协作是主场景）。
+- **只读不受限**：`conversation_read` / `outline` / `search` / `context` / `list` 依然能读任意对话。
+  读根本不是这里的边界：日志就落盘在本地，不提供读工具，agent 照样能用文件工具翻——**边界只画在"投递"（会打扰对方、会花对方上下文）上**。
+
+**这条边由插件自己记**（`lib/lineage.js`，账本默认 `~/.dsh-conversation-bridge/lineage.json`）：
+宿主对**普通会话**不记录派生关系（`sessionController.create` 落盘的 meta 只有 `{cwd, agentPreset}`，
+没有 `parentSession`），所以 `conversation_start` 成功时插件自己记一笔 `{opener, child, at}`；
+投递前查一次账本（双向判定）。**只记关系不记内容**——内容在会话日志里，账本删了不丢东西，只是边要重建。
+
+**为什么不用日志推断**：子会话第一条消息里确实有我们的接力头，但要读"第一条消息"得反向翻页到 seq 0
+（会话越长越贵），而且"不带开场消息开窗"的对话没有那条头。
+
+**已知代价（升级到本版本时要注意）**：这一版之前建的对话**没有边**（那时还没记账），所以老搭档之间
+第一次投递会被拒——出路在错误话术里写明了：用 `conversation_start` 再开一次窗（或手工往账本里补一条边）。
+拒绝话术同时给出"只读不受限"的退路，不会让人卡死。
+
+**与 §7 的关系**：§7.2 删掉的是**冷却/环路/深度**那类"对最常见的正常动作设门禁"的护栏；
+§7.4 是另一类——它限制的是**目标范围**（本插件是干什么的），边内的多轮往返完全不受影响。
+
 
 ---
 
@@ -899,6 +928,7 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
 | 2026-10-05 | **投递回归纯管道**：删掉冷却/环路/深度与 `reply` 参数（§7） | ✅ 提交 `2487fa8` |
 | 2026-10-05 | **投递来源声明**：插件侧声明 `agent-message`/`notice`；harness 源码改动 + 测试 + Agent Note 落在 worktree 分支（提交 `1d00742e15`） | ✅ 插件侧已实现并本地验收 |
 | 2026-10-05 | **本机宿主补丁**：把重建的 `lib/index.js` + `lib/typert.host.js` 拷进已安装 Desktop（原文件留 `.bridge-orig`） | ⏳ 待重启后真机复核 GUI 渲染 |
+| 2026-10-05 | **投递范围收紧到交接链**（§7.4）：`conversation_start` 记交接边，`conversation_send` 只放行交接双方；只读不受限 | ✅ 已实现并本地验收（冒烟 9e 块） |
 
 **最后一次验收的结论（第 4 次重启后）**：
 - `conversation_search` 渲染带上 `scannedRange`（0 命中与有命中两种情况都在）✅

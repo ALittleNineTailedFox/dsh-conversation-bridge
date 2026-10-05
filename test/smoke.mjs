@@ -1,11 +1,42 @@
 // dsh-conversation-bridge 冒烟测试：假宿主，忠实复刻宿主的 page/paginate 行为。
 // 运行：node test/smoke.mjs
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, resolveConfig, name, inject } from '../index.js'
 import { isHumanInput } from '../lib/scan.js'
+
+/* ------------------------------------------------------------------ *
+ * 交接关系账：冒烟测试**绝不碰用户家目录**
+ *
+ * 默认账本在 `~/.dsh-conversation-bridge/lineage.json`；这里把 HOME/USERPROFILE 指到临时目录，
+ * 于是默认路径落在临时目录里（顺便验证默认路径逻辑），再预置夹具里那几对"交接双方"的边——
+ * 新版只允许交接双方互投，夹具会话必须先有边，否则老用例会被门禁拒掉。
+ * ------------------------------------------------------------------ */
+
+const SMOKE_HOME = await mkdtemp(join(tmpdir(), 'bridge-smoke-home-'))
+process.env.HOME = SMOKE_HOME
+process.env.USERPROFILE = SMOKE_HOME
+
+/** 夹具里的会话（这些之间的边全部预置：老用例关心的是别的行为，不是门禁）。 */
+const FIXTURE_SESSIONS = [
+  'session-aaa', 'session-bbb', 'session-clean', 'session-ccc', 'session-ddd',
+  'session-eee', 'session-fff', 'session-ggg', 'session-hhh', 'session-iii',
+  'session-X', 'session-Y', 'session-sub',
+]
+const FIXTURE_EDGES = []
+for (let i = 0; i < FIXTURE_SESSIONS.length; i += 1) {
+  for (let j = i + 1; j < FIXTURE_SESSIONS.length; j += 1) {
+    FIXTURE_EDGES.push({ opener: FIXTURE_SESSIONS[i], child: FIXTURE_SESSIONS[j], at: 0 })
+  }
+}
+await mkdir(join(SMOKE_HOME, '.dsh-conversation-bridge'), { recursive: true })
+await writeFile(
+  join(SMOKE_HOME, '.dsh-conversation-bridge', 'lineage.json'),
+  `${JSON.stringify({ version: 1, edges: FIXTURE_EDGES }, null, 2)}\n`,
+  'utf8',
+)
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -737,6 +768,55 @@ assert.deepEqual(inject, ['tools'])
   assert.equal(legacyRead.trust, 'clean', '老宿主上桥前缀兜底也要让 trust 保持 clean')
 }
 
+/* 9e. 交接边门禁：只允许交接双方互投（本插件的产品边界，不是防滥用护栏） */
+{
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const ledgerPath = join(SMOKE_HOME, '.dsh-conversation-bridge', 'lineage.json')
+  const asA = { agent: { session: { id: 'session-edge-a', header: { cwd: '<工作区>' } } } }
+  const asC = { agent: { session: { id: 'session-edge-c', header: { cwd: '<工作区>' } } } }
+
+  // ① A 用 conversation_start 拉起 B ⇒ 记一条交接边
+  const started = await tools.get('conversation_start').execute({ title: '交接-B', message: '交接件正文' }, asA)
+  const bId = started.sessionId
+  const ledger = JSON.parse(await readFile(ledgerPath, 'utf8'))
+  assert.ok(
+    ledger.edges.some((edge) => edge.opener === 'session-edge-a' && edge.child === bId),
+    '开窗必须把这条交接边记进账本',
+  )
+
+  // ② 交接双方双向都通
+  const toB = await tools.get('conversation_send').execute({ sessionId: bId, text: '把结论给我' }, asA)
+  assert.equal(toB.accepted, true, 'A → B（我拉起的对话）必须能投')
+  const asB = { agent: { session: { id: bId, header: {} } } }
+  const toA = await tools.get('conversation_send').execute({ sessionId: 'session-edge-a', text: '结论如下' }, asB)
+  assert.equal(toA.accepted, true, 'B → A（拉起我的对话）必须能投')
+
+  // ③ 无关对话：两个方向都拒，且要说清这是"本插件只做交接"并给出出路
+  const refusal = await tools.get('conversation_send')
+    .execute({ sessionId: 'session-edge-c', text: '随便聊两句' }, asA)
+    .then(() => undefined, (error) => error)
+  assert.ok(refusal instanceof Error, 'A → C（无关对话）必须拒绝')
+  assert.match(refusal.message, /只做\*\*交接\*\*|没有交接关系/, '拒绝要说明这是产品边界而不是别的错')
+  assert.match(refusal.message, /conversation_start/, '拒绝要给出可操作出路：开窗建立交接边')
+  const reverse = await tools.get('conversation_send')
+    .execute({ sessionId: 'session-edge-a', text: '无关对话主动找我' }, asC)
+    .then(() => undefined, (error) => error)
+  assert.ok(reverse instanceof Error, 'C → A 同样拒绝（只信任交接边，不看谁先开口）')
+
+  // ④ 只读不受门禁影响：边界只画在"投递"上
+  const readAny = await tools.get('conversation_read').execute({ sessionId: 'session-aaa' }, asA)
+  assert.ok(Array.isArray(readAny.messages), '只读仍可读任意对话')
+
+  // ⑤ 重启（新 harness、同一个账本）之后这条边仍然有效
+  const restarted = createHarness()
+  apply(restarted.ctx, {})
+  const afterRestart = await toolMap(restarted.tools)
+    .get('conversation_send').execute({ sessionId: bId, text: '重启后再问一句' }, asA)
+  assert.equal(afterRestart.accepted, true, '交接边落在账本里，重启后仍然有效')
+}
+
 /* 10. 只读不唤醒：只读工具全程不得碰 resolveAgent */
 {
   const harness = createHarness()
@@ -1081,4 +1161,4 @@ async function tempDir() {
 
 for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true })
 
-console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信/多轮畅通) + 压缩点/可信度四态(含工具调用帧与旧答复) + 防呆(自问/限频) + 中继落款 + 投递来源声明(relay/notice/老宿主兜底) + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')
+console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信/多轮畅通) + 压缩点/可信度四态(含工具调用帧与旧答复) + 防呆(自问/限频) + 中继落款 + 投递来源声明(relay/notice/老宿主兜底) + 交接边门禁(双向放行/无关拒绝/重启后仍有效) + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')
