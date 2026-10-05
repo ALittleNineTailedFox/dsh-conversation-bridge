@@ -20,6 +20,7 @@ import { copyFileSync, existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 const PACKAGE_PATH = join('node_modules', '@deepseek-ai', 'dsh-api-session-controller', 'lib')
+// 本机维护脚本：下面两个默认路径是**功能性**的（本机安装位置/产物位置），换机器时用 --app / --from 覆盖
 const DEFAULT_APP = 'D:\\software\\DSH Desktop\\resources\\app'
 // 已打补丁的构建产物（不再依赖 harness worktree：那边的源码已按用户要求回退到 tag，只剩这份产物）
 const DEFAULT_FROM = 'D:\\project\\dsh\\dsh-host-patch-0.2.0-rc.2'
