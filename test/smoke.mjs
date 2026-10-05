@@ -552,12 +552,17 @@ assert.deepEqual(inject, ['tools'])
   await assert.rejects(() => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: 'q' }, asB), /不能给自己发消息/)
 
   await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '第一次' }, asB)
-  // 环路被拒时，错误里必须点明出路：如果你是在答复，传 reply: true
+  // **单向依赖必须放行**：B 问过 A，A 回话给 B —— 这是最常见的交接场景（新对话回问旧对话、旧对话回答）。
+  // 真机事故就是这里被误拦：A 开 B → B 回问 A → A 想回 B 被拒 → 两边全停。
+  const answerBack = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '你问我的那个是 X' }, asA)
+  assert.equal(answerBack.accepted, true, '单向依赖时，回话给对方必须放行（否则一个问答就把双方停摆）')
+
+  // **双向依赖才是真环**：现在 A 也问过 B 了，再问就是"提问引发提问"的接力 → 拦
   await assert.rejects(
-    () => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '回信回来' }, asA),
+    () => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '再问一次' }, asA),
     (error) => /环路/.test(error.message) && /reply: true/.test(error.message),
   )
-  // 但同一场景传 reply: true 就必须放行（答复不受环路约束）
+  // 同一场景传 reply: true 就必须放行（答复不受环路约束）
   const cycled = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '这是我的答复', reply: true }, asA)
   assert.equal(cycled.accepted, true, '答复必须能穿过环路护栏')
 

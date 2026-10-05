@@ -340,12 +340,21 @@ function createGuard(config) {
     }
     if (options.reply === true) return { ok: true, depth }
     if (reaches(targetId, askerId)) {
+      // 目标在"我"的依赖链上 = 它（直接或间接）问过我。
+      //
+      // 这有两种截然不同的情况，必须分开：
+      //   ① **它问过我、我没问过它**（单向）⇒ 这就是我在**回话给它**（最常见的交接场景：
+      //     新对话回问旧对话，旧对话回答）。放行——否则一个问答就被判成环，双方直接停摆
+      //     （真机事故：A 开 B → B 回问 A → A 想回 B 被拒 → 两边都停了）。
+      //   ② **互相问过**（双向）⇒ 这才是"提问引发提问"的接力，拦掉。
+      if (!reaches(askerId, targetId)) return { ok: true, depth }
       return {
         ok: false,
         reason: 'cycle',
-        message: '检测到消息环路（这条链上已经有人在互相要答复）。'
+        message: '检测到消息环路（你们已经互相问过一轮，再问就成了接力）。'
           + '**如果你是在答复对方**（而不是新提问），传 `reply: true` 再发一次即可——答复不受环路约束；'
-          + '确实是新提问就请改为翻旧书（conversation_outline / conversation_search / conversation_read）。',
+          + '确实是新提问就请改为翻旧书（conversation_outline / conversation_search / conversation_read），'
+          + '或把该说的写进自己的正文里让对方读。',
       }
     }
     const pairKey = `${askerId}\u0000${targetId}`
@@ -368,8 +377,15 @@ function createGuard(config) {
     return { ok: true, depth }
   }
 
-  function record(askerId, targetId) {
-    dependsOn.set(askerId, targetId)
+  /**
+   * 记录一次投递。
+   *
+   * **只有"新提问"才进依赖链**：答复是对既有消息的回答，把它也记成"依赖"会让
+   * 一问一答累积成"互相依赖"，之后任何一封都被环比对判成环（真机事故的根因）。
+   * 冷却与频率仍然照记——那是防刷屏的，不区分问答。
+   */
+  function record(askerId, targetId, options = {}) {
+    if (options.reply !== true) dependsOn.set(askerId, targetId)
     const now = Date.now()
     lastAskAt.set(`${askerId}\u0000${targetId}`, now)
     recent.push(now)
@@ -1038,7 +1054,7 @@ function buildTools(api, config) {
           throw asDeliveryError(error, sessionId)
         }
 
-        api.guard.record(senderId, sessionId)
+        api.guard.record(senderId, sessionId, { reply })
 
         return {
           sessionId,
