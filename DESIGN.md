@@ -1,9 +1,9 @@
 # dsh-conversation-bridge · 设计文档
 
 > 版本：v2 设计（回问优先）
-> 日期：2026-10-04
+> 日期：2026-10-04（2026-10-05 更新：投递来源声明 §7.3）
 > 位置：`<仓库根>\DESIGN.md`
-> 状态：**设计定稿，等待开工**（尚未按本设计改代码；当前工作区代码是 v1 实现）
+> 状态：**v2 已实现并真机验收**（9 工具）；宿主来源声明需要打一次宿主补丁（§7.3）
 
 ---
 
@@ -11,11 +11,11 @@
 
 ### 0.1 一分钟现状
 
-- 本目录已有一个**可运行的 v1 插件**（`index.js`），已装进 desktop profile（`link:` 挂载），注册了 5 个工具。
-- **v1 与本文档的差距**：v1 是"发消息/读最近 N 条"，**没有**只读全量检索、没有可信度读数、没有护栏、`conversation_context` 还会误唤醒对方；而且**依赖外部记忆插件**（已按本篇去掉）。
-- **源码已修、线上未装**的一个 bug：`sessionController.prompt` 漏传 `AbortSignal`（详见 §3.2）。
-- **另一处 v1 隐藏失效**：`conversation_read` 用了 `throughSeq: -1` ⇒ 永远空页（详见 §3.4），重写时必须改。
-- **配置改动/代码改动都需要重启 DSH 才生效**（`install_bundle` 对已装包返回 `restart-required`）。所以设计阶段不要在"调参数看效果"上耗时间。
+- 插件 **9 个工具**（7 个跨对话 + 2 个本地交接件），`node test/smoke.mjs` 全绿，`main` 已推送。
+- **代码/配置改动都必须重启 DSH**（`link:` 挂载也不热重载）；**装/升级之前启动的对话看不到新工具**（系统提示词按会话落盘复用）。
+- **投递在 GUI 里像用户消息**这件事有两个层次：插件侧已声明来源（§7.3），宿主侧需要打补丁才认这个声明；
+  没打补丁时退回旧行为（消息仍记成 user，靠 `bridge-` 前缀兜底），功能不受影响。
+- 宿主补丁的可重放脚本：`tools/host-prompt-source-patch.mjs`（`apply` / `revert` / `status`）。
 
 ### 0.2 权威事实在哪里
 
@@ -730,6 +730,49 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
    这个补丁也就没有存在价值。
 4. **该防的是代码死循环**，那是全局频率的活，与"模型会不会乱发"无关。
 
+### 7.3 投递来源：让宿主知道"这不是用户说的话"（2026-10-05 新增）
+
+**问题**：宿主 `prompt` 把每条被受理的消息固定写成 `{kind:'user', rpcId}`，于是跨对话消息与水位提醒在 GUI 里
+渲染成**用户自己的大气泡**，看起来像用户亲手说的；列表 recency 也把它当成"最新用户提示词"。
+
+**宿主侧的事实**（0.2.0-rc.2 源码 + 真机核对）：
+
+| 位置 | 事实 |
+|---|---|
+| `packages/api/session-controller/src/commands.ts` | `prompt` 里 `source` 硬编码 `{kind:'user', rpcId}`，没有第二条投递路径 |
+| `packages/llm/llm/src/message.ts` | `MessageSourceMap` **可合并扩展**；V4 里 `kind` 就是生产者身份 |
+| `packages/client/ui-chat/.../message.ts` | `source.kind !== 'user'` ⇒ 渲染成"注入的上下文"（带 `form`/producer 标注 + turn-trigger 行） |
+| `packages/subagent/subagent/src/continuation-messages.ts` | `agent-message` = `{kind:'agent-message', form:'relay', senderSessionId}`，GUI 显示"来自会话 X" |
+| `packages/typert/protocol/src/types.ts` | `ctx.invocation` **只在 Gateway 调用派生出的 Context 上存在**；直接进程内调用没有 ⇒ 可用来分辨"谁在调用" |
+
+**做法（插件侧，已实现）**：
+
+- `conversation_send` 投递时带 `source: { kind:'agent-message', form:'relay', senderSessionId }`（发信会话 = 真正作者，子 agent 中继时是子 agent 自己，回信地址仍在正文落款里）。
+- 水位提醒带 `source: { kind:'conversation-bridge', form:'notice', summary }`（一句话说明，压成一行并截到宿主上限 120 字符内）。
+- `conversation_start` 的首条消息**故意保持 user 来源**：那是"用户开了一个新对话并把交接件贴进去"，
+  会话标题与列表 recency 都依赖它是一条用户提示词。
+
+**宿主侧改动（本机已打补丁；上游路径见下）**：
+
+- `SessionPromptRequest` 增加可选 `source`（`kind` + 可选 `form`/`senderSessionId`/`summary`）；
+  `prompt` 校验后原样落盘，并照旧把 `requestId` 记成 `rpcId`（去重与锚点规则不变）。
+- **只有直接的进程内调用方能用**：`SessionController.prompt` 传 `this.ctx.invocation`，有 invocation（浏览器/任何 Remote 调用方）就拒。
+- 版本：`dsh-conversation-bridge` 侧的适配**向后兼容** —— 老宿主忽略 `source` 字段，消息退回 user 来源，
+  `bridge-` 前缀兜底继续生效（`isHumanInput` 两条口径都在）。
+
+**为什么需要宿主改动而不能纯插件解决**：`sessionController` 暴露的投递入口只有 `prompt`，而它写死来源；
+`subagents.followup` 只对"自己的子 agent"有效；`agent.inject` 只对热会话有效且不唤醒模型。
+
+**上游路径（未做，属于"治本链路"）**：
+
+1. 源码改动已落在 harness worktree `<工作区>\dsh\deepseek-harness-0.2.0-rc.2`
+   （分支 `fix/session-prompt-declared-source`，提交 `1d00742e15`），含单元测试、双语 README、Agent Note。
+2. 要进上游需按该仓流程提 PR；要进本机 Desktop 则必须重打包（`resources/app` 是打包产物）。
+3. **本机现在的做法**：把重建出来的 `lib/index.js` + `lib/typert.host.js` 拷进已安装的
+   `resources/app/node_modules/@deepseek-ai/dsh-api-session-controller/lib/`，
+   原文件留 `.bridge-orig` 备份；`tools/host-prompt-source-patch.mjs` 可重放/回退。
+   **DSH Desktop 升级会覆盖掉这个补丁**，届时重跑一次脚本即可（脚本会先核对标记再动手）。
+
 ---
 
 ## 8. 交接链
@@ -853,6 +896,9 @@ recent: number[]      // 最近一分钟的投递时刻，只用于限频
 | 2026-10-04 | **第 3 次重启 → 复验 8 项**：7 项通过；剩下 trust 噪声规则（真 bug）与 search 渲染 | ✅ 修复提交 `13811c4` |
 | 2026-10-04 | **第 4 次重启 → 复验最后 2 项：全部通过** | ✅ 功能完工 |
 | 2026-10-04 | 水位提醒在**本对话自身**触发两次（70.0% / 71.5%），并暴露"提醒让模型调一个本会话不可见的工具"⇒ 文案改为工具无关的兜底写法 | ✅ 真机验证 |
+| 2026-10-05 | **投递回归纯管道**：删掉冷却/环路/深度与 `reply` 参数（§7） | ✅ 提交 `2487fa8` |
+| 2026-10-05 | **投递来源声明**：插件侧声明 `agent-message`/`notice`；harness 源码改动 + 测试 + Agent Note 落在 worktree 分支（提交 `1d00742e15`） | ✅ 插件侧已实现并本地验收 |
+| 2026-10-05 | **本机宿主补丁**：把重建的 `lib/index.js` + `lib/typert.host.js` 拷进已安装 Desktop（原文件留 `.bridge-orig`） | ⏳ 待重启后真机复核 GUI 渲染 |
 
 **最后一次验收的结论（第 4 次重启后）**：
 - `conversation_search` 渲染带上 `scannedRange`（0 命中与有命中两种情况都在）✅

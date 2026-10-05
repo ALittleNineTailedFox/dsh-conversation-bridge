@@ -160,6 +160,13 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   同样投不进去——这是宿主的安全规则，不是插件的 bug。
 - 子 agent 会话的**上下文占用可能读不到**（宿主对该投影的限制），此时 `conversation_context`
   会如实报 `available:false`。
+- **跨对话消息在 GUI 里长什么样，取决于宿主版本**：插件投递时会声明来源
+  （`agent-message` 中继 / 本插件的 `notice`），**认这个声明的宿主**会把它渲染成
+  "来自会话 X 的中继消息"或一行注入提示；**不认的宿主**会忽略该字段，消息按用户消息显示
+  （此时靠 `bridge-` 前缀把它和真人插话区分开，功能不受影响）。
+  本机让宿主认这个声明需要打一次宿主补丁，见 `DESIGN.md` §7.3 与 `tools/host-prompt-source-patch.mjs`。
+- **`conversation_start` 的首条消息仍然是"用户消息"**（故意）：那是"用户开了一个新对话并贴进交接件"，
+  会话标题与列表排序都依赖它是一条用户提示词。
 
 ---
 

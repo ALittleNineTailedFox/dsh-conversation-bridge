@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, resolveConfig, name, inject } from '../index.js'
+import { isHumanInput } from '../lib/scan.js'
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -91,6 +92,17 @@ function createHarness(options = {}) {
     { sessionId: 'session-sub2', updatedAt: 3000, running: false, blank: true, agentAvailable: false, origin: 'subagent', parentSessionId: 'session-sub' },
   ]
   const calls = { page: [], prompt: [], create: [], rename: [], projections: [], resolveAgent: 0 }
+  /**
+   * 复刻宿主对 prompt 来源的两种口径：
+   * - 支持声明来源的宿主：调用方给了 `source` 就照它落盘，并补上宿主自己的 `rpcId`。
+   * - 老宿主（`options.legacyPromptSource`）：忽略 `source`，一律写 `{kind:'user', rpcId}`。
+   */
+  function promptSourceOf(request) {
+    if (options.legacyPromptSource === true || request.source === undefined) {
+      return { kind: 'user', rpcId: request.requestId }
+    }
+    return { ...request.source, rpcId: request.requestId }
+  }
   const liveAgents = new Map()
   let compactionOnNextReply = false
   let replyOnNextPrompt = true
@@ -181,7 +193,7 @@ function createHarness(options = {}) {
       calls.prompt.push(request)
       append(request.sessionId, {
         type: 'user/message', time: 2000,
-        data: { content: request.content, source: { kind: 'user', rpcId: request.requestId } },
+        data: { content: request.content, source: promptSourceOf(request) },
       })
       if (replyOnNextPrompt) {
         if (compactionOnNextReply) {
@@ -675,6 +687,56 @@ assert.deepEqual(inject, ['tools'])
   )
 }
 
+/* 9d. 投递来源声明：跨对话消息与水位提醒在宿主里都不是"用户自己说的话" */
+{
+  // ① 支持声明来源的宿主：source 照原样落盘（+ 宿主补的 rpcId）
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const tools = toolMap(harness.tools)
+  const asA = { agent: { session: { id: 'session-aaa', header: {} } } }
+  const sent = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '把结论给我' }, asA)
+  assert.deepEqual(
+    harness.calls.prompt.at(-1).source,
+    { kind: 'agent-message', form: 'relay', senderSessionId: 'session-aaa' },
+    '跨对话投递必须声明 relay 来源（senderSessionId 是发信会话）',
+  )
+  const recorded = harness.logs.get('session-bbb').findLast((event) => event.type === 'user/message')
+  assert.equal(recorded.data.source.kind, 'agent-message', '宿主落盘的来源不得是 user（否则 GUI 渲染成用户气泡）')
+  assert.equal(recorded.data.source.form, 'relay')
+  assert.equal(recorded.data.source.senderSessionId, 'session-aaa')
+  assert.equal(recorded.data.source.rpcId, sent.messageId, '宿主仍要把 requestId 记成 rpcId，锚点才好用')
+  // 锚点照旧能定位这条消息（来源换了形态，readRpcId 仍读 source.rpcId）；
+  // 且它自己不再被算成"真人并发插话"——这正是旧口径下把自己 trust 打成 unknown 的那条
+  const readBack = await tools.get('conversation_read').execute({ sessionId: 'session-bbb', messageId: sent.messageId }, asA)
+  assert.equal(readBack.trust, 'clean', '插件自己的投递不得被算成真人并发噪声')
+
+  // ② 水位提醒：本插件自己的生产者名 + notice 形态，summary 必须在宿主上限内
+  const reminderHarness = createHarness()
+  apply(reminderHarness.ctx, { handoff: { cooldownMs: 0, handoffQuietMs: 60000, evalMinIntervalMs: 0 } })
+  const session = { id: 'session-live', header: { cwd: '<工作区>', origin: 'session' } }
+  reminderHarness.liveAgents.set('session-live', { id: 'session-live', session })
+  reminderHarness.setPressure({ contextWindow: 100000, pressureTokens: 80000, surfaceTokens: 0, sampledSurfaceTokens: 0 })
+  reminderHarness.fire(session, 'assistant/message')
+  await settle()
+  const reminder = reminderHarness.calls.prompt.at(-1)
+  assert.equal(reminder.source.kind, 'conversation-bridge', '提醒要用本插件自己的生产者名')
+  assert.equal(reminder.source.form, 'notice')
+  assert.ok(reminder.source.summary.length > 0 && reminder.source.summary.length <= 120, 'summary 必须在宿主上限内，否则整条投递被拒')
+  assert.ok(!reminder.source.summary.includes('\n'), 'summary 必须是一行')
+
+  // ③ 老宿主兜底：忽略 source，一律 user + bridge 前缀；本插件读回时仍不算"真人插话"
+  const legacy = createHarness({ legacyPromptSource: true })
+  apply(legacy.ctx, {})
+  const legacyTools = toolMap(legacy.tools)
+  const legacySent = await legacyTools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '老宿主上也要能发' }, asA)
+  const legacyRecorded = legacy.logs.get('session-bbb').findLast((event) => event.type === 'user/message')
+  assert.equal(legacyRecorded.data.source.kind, 'user', '老宿主忽略 source：退回 user 来源')
+  assert.ok(legacyRecorded.data.source.rpcId.startsWith('bridge-'), '退回时 rpcId 必须带桥前缀，供 isHumanInput 兜底')
+  assert.equal(isHumanInput(legacyRecorded), false, '桥前缀兜底：插件自己的消息不得算成真人并发插话')
+  const legacyRead = await legacyTools.get('conversation_read').execute({ sessionId: 'session-bbb', messageId: legacySent.messageId }, asA)
+  assert.equal(legacyRead.trust, 'clean', '老宿主上桥前缀兜底也要让 trust 保持 clean')
+}
+
 /* 10. 只读不唤醒：只读工具全程不得碰 resolveAgent */
 {
   const harness = createHarness()
@@ -1019,4 +1081,4 @@ async function tempDir() {
 
 for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true })
 
-console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信/多轮畅通) + 压缩点/可信度四态(含工具调用帧与旧答复) + 防呆(自问/限频) + 中继落款 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')
+console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信/多轮畅通) + 压缩点/可信度四态(含工具调用帧与旧答复) + 防呆(自问/限频) + 中继落款 + 投递来源声明(relay/notice/老宿主兜底) + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')

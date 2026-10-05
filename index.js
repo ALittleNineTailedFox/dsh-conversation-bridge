@@ -37,9 +37,46 @@ export const inject = ['tools']
  * 宿主把 `prompt` 投递的消息一律写成 `{kind:'user', rpcId}`，与真人输入无法区分；
  * 加前缀后，**装了本插件的收信方**就能把这条识别成"插件发的"，不误判成真人并发插话
  * （否则插件自己发的反问/回信会把上一条提问的 `trust` 打成 `unknown`）。
+ *
+ * 支持声明来源的宿主版本会直接把它记成非 user 来源（见 {@link relaySource}），
+ * 此时前缀这条兜底不再被用到；留着是为了**老宿主上行为不变**。
  */
 function bridgeRequestId() {
   return `${BRIDGE_RPC_PREFIX}${randomUUID()}`
+}
+
+/**
+ * 跨对话投递在宿主里声明的来源（`prompt` 的 `source` 字段）。
+ *
+ * 宿主对浏览器 prompt 固定写 `{kind:'user'}` —— 插件投递的消息因此在 GUI 里长得像用户自己说的话。
+ * 允许**进程内调用方**声明生产者的宿主版本会按这里的 `kind/form` 落盘，
+ * 于是它渲染成"来自会话 {senderSessionId} 的中继消息"（与宿主 `send_message` 同一种来源），
+ * 而不是用户气泡。老宿主忽略这个字段（消息退回 user 来源 + bridge 前缀兜底），
+ * 所以带上它永远是安全的 —— 不需要能力探测。
+ *
+ * @param {string} senderSessionId - 真正发出这条消息的会话（子 agent 中继时是子 agent 自己，回信地址在正文落款里）。
+ */
+function relaySource(senderSessionId) {
+  return { kind: 'agent-message', form: 'relay', senderSessionId }
+}
+
+/** 宿主对 `notice.summary` 的硬上限（`CONTEXT_SUMMARY_MAX_CHARS`）：超了整条投递会被拒。 */
+const SUMMARY_MAX_CHARS = 120
+
+/**
+ * 交接提醒在宿主里声明的来源：本插件自己的生产者名 + `notice` 形态。
+ *
+ * 提醒是插件生成的提示，不是用户说的话 —— 声明来源后 GUI 渲染成一行可折叠的注入提示。
+ * @param {string} summary - 一句话交代（会被压成一行并截到宿主上限内）。
+ */
+function reminderSource(summary) {
+  const text = String(summary ?? '').replace(/\s+/g, ' ').trim()
+  const clipped = text.length === 0 ? PLUGIN : text
+  return {
+    kind: PLUGIN,
+    form: 'notice',
+    summary: clipped.length <= SUMMARY_MAX_CHARS ? clipped : `${clipped.slice(0, SUMMARY_MAX_CHARS - 1)}…`,
+  }
 }
 
 const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不要改文件、不要展开、不要重做已做过的工作。
@@ -972,6 +1009,8 @@ function buildTools(api, config) {
             sessionId,
             mode,
             content: textBlocks(body),
+            // 声明"这条是会话 senderId 发来的"：GUI 里渲染成中继消息而不是用户气泡（老宿主忽略）
+            source: relaySource(senderId),
           }, signalOf(exec))
         } catch (error) {
           throw asDeliveryError(error, sessionId)
@@ -1501,6 +1540,8 @@ export function apply(ctx, input = {}) {
           sessionId: session.id,
           mode: config.handoff.deliver,
           content: textBlocks(text),
+          // 声明"这是本插件注入的提示"：GUI 里是一行注入提示，不是用户气泡（老宿主忽略）
+          source: reminderSource(`上下文已用 ${pressure.percent}%，${PLUGIN} 提示写交接件`),
         }, idleSignal()).then(
           () => ctx.logger?.info?.(`${PLUGIN}: 已向 ${String(session.id)} 注入交接提醒（${pressure.percent}%）`),
           (error) => api.warn(`向 ${String(session.id)} 注入提醒失败: ${String(error)}`),
