@@ -51,16 +51,13 @@ const DEFAULT_ASK_TEMPLATE = `只回答下面这个问题，不要复盘、不�
  * 每一条跨对话消息都带的落款。
  *
  * 不判断"对方该不该回"——那是收信人自己的决定（它可能答、可能反问、可能只记下）。
- * 落款负责三件事：说明这条来自哪个对话；告诉对方要回时用哪个工具、往哪回；
- * **并明确要求答复时传 `reply=true`**——漏传会被当成新提问：轻则被包上窄指令，
- * 重则撞环路护栏（对方问过你时，你的回信会被直接拒）。真机实测撞到过 B 漏传。
+ * 落款只做两件事：说明这条来自哪个对话；告诉对方要回时用哪个工具、往哪回。
+ * **不设任何门禁**：回不回是收信人的判断，工具层不替它做决定。
  */
 const DEFAULT_REPLY_GUIDE = `
 ---
 [对话间消息] 本条由对话 sessionId={{fromSessionId}} 通过 ${PLUGIN} 发来。
-- 你要回它：用 \`conversation_send\`（sessionId={{fromSessionId}}，**reply=true**）把话发回去。
-  reply=true 表示"这是答复"：不包窄指令，也不受"刚问过这个对话"的冷却与环路约束。
-  **漏传 reply=true 会被当成新提问**——对方问过你时，你的回信会被环路护栏直接拒。`
+- 你要回它：直接用 \`conversation_send\`（sessionId={{fromSessionId}}）把话发回去即可。`
 
 const DEFAULT_REMINDER = `<context_handoff level="warning">
 ⚠️ 本对话上下文已用到 {{percent}}%（约 {{tokens}} / {{window}} tokens，阈值 {{threshold}}%）。
@@ -82,8 +79,6 @@ const DEFAULT_REMINDER = `<context_handoff level="warning">
 const DEFAULTS = Object.freeze({
   exposeTools: true,
   ask: Object.freeze({
-    maxDepth: 3,
-    pairCooldownMs: 600000,
     globalPerMinute: 30,
     // 默认必须走**插入**（用户裁定）：对方正在思考/跑工具时，这条插进它下一步就能看到；
     // 排在"本轮结束之后"会让发送方看起来在干等，而且对方思考中根本收不到。
@@ -173,8 +168,6 @@ export function resolveConfig(input) {
   return {
     exposeTools: readBoolean(raw.exposeTools, DEFAULTS.exposeTools),
     ask: {
-      maxDepth: readInteger(askRaw.maxDepth, DEFAULTS.ask.maxDepth, 0, 20),
-      pairCooldownMs: readInteger(askRaw.pairCooldownMs, DEFAULTS.ask.pairCooldownMs, 0, 24 * 3600 * 1000),
       globalPerMinute: readInteger(askRaw.globalPerMinute, DEFAULTS.ask.globalPerMinute, 1, 600),
       defaultMode: askRaw.defaultMode === 'queue' ? 'queue' : DEFAULTS.ask.defaultMode,
       narrow: readBoolean(askRaw.narrow, DEFAULTS.ask.narrow),
@@ -285,113 +278,46 @@ const BOOLEAN = { type: 'boolean' }
 const NUMBER = { type: 'number' }
 
 /* ------------------------------------------------------------------ *
- * 护栏（§7）
+ * 投递前的防呆检查（§7）
+ *
+ * 设计锚点是宿主自己的 `send_message`（主子 agent 通信）：它只有两个参数，
+ * 执行体就一句 `ctx.subagents.followup(...)` —— **没有冷却、没有环路检测、没有深度上限**。
+ * 防滥用的责任在调用方的判断与用户的可视干预，不该由工具层设门禁。
+ *
+ * 这里只留一个**防呆**（防的是代码死循环，不是防模型）：全局限频。
  * ------------------------------------------------------------------ */
 
 function createGuard(config) {
-  /** asker → target：谁依赖谁（用于环路与深度，不靠模型传参） */
-  const dependsOn = new Map()
-  const lastAskAt = new Map()
+  /** 最近一分钟的投递时刻，只用于全局限频。 */
   const recent = []
 
-  function depthOf(sessionId) {
-    let depth = 0
-    let cursor = dependsOn.get(sessionId)
-    const seen = new Set([sessionId])
-    while (cursor !== undefined && !seen.has(cursor)) {
-      depth += 1
-      seen.add(cursor)
-      cursor = dependsOn.get(cursor)
-    }
-    return depth
-  }
-
-  function reaches(from, goal) {
-    let cursor = from
-    const seen = new Set()
-    while (cursor !== undefined && !seen.has(cursor)) {
-      if (cursor === goal) return true
-      seen.add(cursor)
-      cursor = dependsOn.get(cursor)
-    }
-    return false
-  }
-
   /**
-   * 投递前的护栏。
-   *
+   * 投递前检查：只挡"空 id / 发给自己 / 一分钟内发太多"。
    * @param askerId - 发送方 sessionId
    * @param targetId - 目标 sessionId
-   * @param options - `reply`：这一条是对既有消息的答复（回信/通知）。
-   *   回信不该被"刚问过这个对话"的同对冷却拦住，也天然落在对方问你的那条链上——
-   *   环路护栏防的是"提问引发提问"的无限接力，不是"把结论答回去"；深度上限仍然是兜底。
    */
-  function check(askerId, targetId, options = {}) {
+  function check(askerId, targetId) {
     if (askerId === '' || targetId === '') return { ok: false, reason: 'missing-id' }
     if (askerId === targetId) return { ok: false, reason: 'self', message: '不能给自己发消息。' }
-    const depth = depthOf(askerId)
-    if (depth + 1 > config.ask.maxDepth) {
-      return {
-        ok: false,
-        reason: 'depth',
-        depth,
-        message: `已达发消息深度上限（${config.ask.maxDepth} 跳）。请改为翻旧书（conversation_outline / conversation_search / conversation_read），或把该留下的写进交接件。`,
-      }
-    }
-    if (options.reply === true) return { ok: true, depth }
-    if (reaches(targetId, askerId)) {
-      // 目标在"我"的依赖链上 = 它（直接或间接）问过我。
-      //
-      // 这有两种截然不同的情况，必须分开：
-      //   ① **它问过我、我没问过它**（单向）⇒ 这就是我在**回话给它**（最常见的交接场景：
-      //     新对话回问旧对话，旧对话回答）。放行——否则一个问答就被判成环，双方直接停摆
-      //     （真机事故：A 开 B → B 回问 A → A 想回 B 被拒 → 两边都停了）。
-      //   ② **互相问过**（双向）⇒ 这才是"提问引发提问"的接力，拦掉。
-      if (!reaches(askerId, targetId)) return { ok: true, depth }
-      return {
-        ok: false,
-        reason: 'cycle',
-        message: '检测到消息环路（你们已经互相问过一轮，再问就成了接力）。'
-          + '**如果你是在答复对方**（而不是新提问），传 `reply: true` 再发一次即可——答复不受环路约束；'
-          + '确实是新提问就请改为翻旧书（conversation_outline / conversation_search / conversation_read），'
-          + '或把该说的写进自己的正文里让对方读。',
-      }
-    }
-    const pairKey = `${askerId}\u0000${targetId}`
-    const last = lastAskAt.get(pairKey) ?? 0
-    const waitMs = config.ask.pairCooldownMs - (Date.now() - last)
-    if (waitMs > 0) {
-      return {
-        ok: false,
-        reason: 'cooldown',
-        waitMs,
-        message: `刚问过这个对话，请等 ${Math.ceil(waitMs / 1000)} 秒再问；期间可以先翻旧书。`
-          + '（**如果你是在答复对方**，传 `reply: true` 即可，答复不受同对冷却约束。）',
-      }
-    }
     const now = Date.now()
     while (recent.length > 0 && now - recent[0] > 60000) recent.shift()
     if (recent.length >= config.ask.globalPerMinute) {
-      return { ok: false, reason: 'rate', message: `发消息过于频繁（每分钟上限 ${config.ask.globalPerMinute} 次），请稍后。` }
+      return {
+        ok: false,
+        reason: 'rate',
+        message: `一分钟内已投递 ${recent.length} 条（上限 ${config.ask.globalPerMinute}）。`
+          + '这多半是代码层面的死循环，而不是你发得太勤——请先确认自己不是在重复投同一条。',
+      }
     }
-    return { ok: true, depth }
+    return { ok: true }
   }
 
-  /**
-   * 记录一次投递。
-   *
-   * **只有"新提问"才进依赖链**：答复是对既有消息的回答，把它也记成"依赖"会让
-   * 一问一答累积成"互相依赖"，之后任何一封都被环比对判成环（真机事故的根因）。
-   * 冷却与频率仍然照记——那是防刷屏的，不区分问答。
-   */
-  function record(askerId, targetId, options = {}) {
-    if (options.reply !== true) dependsOn.set(askerId, targetId)
-    const now = Date.now()
-    lastAskAt.set(`${askerId}\u0000${targetId}`, now)
-    recent.push(now)
+  /** 记录一次投递（只用于限频）。 */
+  function record() {
+    recent.push(Date.now())
   }
 
-  return { check, record, depthOf }
+  return { check, record }
 }
 
 /* ------------------------------------------------------------------ *
@@ -965,7 +891,7 @@ function buildTools(api, config) {
         properties: {
           sessionId: { type: 'string', description: '要塞给哪个对话（交接时对方给你的 sessionId，或 conversation_list 里查到的）' },
           text: { type: 'string', description: '要说的话：问题、要它给的结论、进度、或"不用再回我"' },
-          reply: { type: 'boolean', description: '这一条是对既有消息的答复时传 true：不包窄指令、不受"刚问过这个对话"的冷却与环路护栏约束（护栏只拦"提问引发提问"的接力）' },
+          narrow: { type: 'boolean', description: '是否把内容包成窄指令（默认 true：只回答、不复盘、不展开、不重做）。发答复或长内容时传 false' },
           mode: { type: 'string', enum: ['steer', 'queue'], description: 'steer=插进对方当前回合的下一步（默认）；queue=等对方本轮结束再排' },
           wake: { type: 'boolean', description: '是否唤醒它（默认 true）。只有你想"静默留在收件箱、等它自己下次醒来再看"时传 false' },
         },
@@ -977,7 +903,6 @@ function buildTools(api, config) {
           accepted: BOOLEAN,
           mode: STRING,
           woken: BOOLEAN,
-          depth: INTEGER,
           narrow: BOOLEAN,
           replyTo: STRING,
           relayed: BOOLEAN,
@@ -1009,9 +934,7 @@ function buildTools(api, config) {
         if (text === '') throw new Error(`${PLUGIN}: conversation_send 需要 text`)
 
         const { selfId: senderId, replyTo, relayed } = replyAddress(exec)
-        const reply = args.reply === true
-        // 提问：同对冷却、环路、深度全过；答复：只走深度（护栏不该拦"把结论答回去"）。
-        const verdict = api.guard.check(senderId, sessionId, { reply })
+        const verdict = api.guard.check(senderId, sessionId)
         if (!verdict.ok) throw new Error(`${PLUGIN}: ${verdict.message}`)
 
         const wake = args.wake !== false
@@ -1021,7 +944,7 @@ function buildTools(api, config) {
         // 目标由子 agent 路由持有 → 宿主必拒；提前报清楚并给退路
         await assertDeliverable(sessionId, exec)
         // 提问才包窄指令；答复本身就是内容，包上反而啰嗦
-        const narrow = !reply && config.ask.narrow
+        const narrow = args.narrow !== false && config.ask.narrow
         const bodyText = narrow ? render(config.ask.narrowTemplate, { question: text }) : text
         // 发信人身份必须随消息走：宿主消息模型没有发信人概念（source 只有 kind / rpcId），
         // 收信方唯一的"该回给谁、怎么回"来源就是这段约定。
@@ -1054,7 +977,7 @@ function buildTools(api, config) {
           throw asDeliveryError(error, sessionId)
         }
 
-        api.guard.record(senderId, sessionId, { reply })
+        api.guard.record(senderId, sessionId)
 
         return {
           sessionId,
@@ -1062,7 +985,6 @@ function buildTools(api, config) {
           accepted: true,
           mode,
           woken: wake,
-          depth: verdict.depth + 1,
           narrow,
           replyTo,
           relayed,
@@ -1412,7 +1334,7 @@ function renderHandoffHeader(vars) {
   return `[接力对话] 这是一段由交接产生的新对话，接替上一段对话。
 - 交接人（上一段对话）sessionId = \`${vars.parentSessionId}\`${vars.parentTitle ? `（标题：${vars.parentTitle}）` : ''}${vars.parentCwd ? `，工作目录：${vars.parentCwd}` : ''}
 ${vars.handoffFile ? `- 本次交接件：\`${vars.handoffFile}\`（可用 conversation_handoffs 传 file 再读一遍）\n` : ''}- **要问它/回给它**：用 \`conversation_send\`（sessionId=\`${contact}\`）把话塞过去，默认插到它的下一步；${relayNote}
-  它是答复（不是新提问）时传 reply=true。它回不回由它决定，你要的东西写进正文。
+  它回不回由它决定，你要的东西写进正文；想让它只答一句就靠 narrow（默认已包）。
 - **取它的结论**：\`conversation_read\`（sessionId + messageId=上一步返回的那个 id）读答复；**先看 answered（答完没），再看 trust**：
   - \`answered:false\` → 它还没答完（可能在跑工具），稍后再读，别当成"它答了个空"；
   - \`clean\` → 直接用；

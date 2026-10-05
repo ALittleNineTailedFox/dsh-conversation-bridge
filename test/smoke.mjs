@@ -443,8 +443,7 @@ assert.deepEqual(inject, ['tools'])
 /* 8. 可信度四态 */
 {
   const harness = createHarness()
-  // 同一目标要连续问几次：关掉同对冷却，免得测到冷却而不是测到语义
-  apply(harness.ctx, { ask: { pairCooldownMs: 0 } })
+  apply(harness.ctx, {})
   const tools = toolMap(harness.tools)
   const exec = { agent: { session: { id: 'session-bbb', header: {} } } }
   const as = (id) => ({ agent: { session: { id, header: {} } } })
@@ -461,7 +460,6 @@ assert.deepEqual(inject, ['tools'])
   // 发信人身份必须随消息走：宿主不提供发信人概念，收信方唯一来源就是这段约定
   assert.match(harness.calls.prompt.at(-1).content[0].text, /sessionId=session-bbb/, '正文必须写明这条来自哪个对话')
   assert.match(harness.calls.prompt.at(-1).content[0].text, /conversation_send/, '正文必须写明回信方法')
-  assert.match(harness.calls.prompt.at(-1).content[0].text, /reply=true/, '落款必须明确要求答复时传 reply=true——漏传会被当成新提问，撞环路护栏（真机撞到过）')
   assert.equal(askedClean.compactionRisk, 'likely', '对方已在 80% → 事前就要预警')
   assert.equal(askedClean.occupancyBefore.source, 'cached')
   assert.match(askedClean.messageId, /^bridge-/, '跨对话投递的 rpcId 必须带桥前缀（收信侧靠它识别"这是插件发的"）')
@@ -541,60 +539,49 @@ assert.deepEqual(inject, ['tools'])
   harness.flags.toolCallOnNextReply = false
 }
 
-/* 9. 护栏：自问 / 环路 / 深度 / 冷却 */
+/* 9. 投递前只留"防呆"：自问 + 全局限频；**正常多轮协作必须完全畅通** */
 {
   const harness = createHarness()
-  apply(harness.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  apply(harness.ctx, { ask: { globalPerMinute: 30 } })
   const tools = toolMap(harness.tools)
   const asB = { agent: { session: { id: 'session-bbb', header: {} } } }
   const asA = { agent: { session: { id: 'session-aaa', header: {} } } }
+  const send = tools.get('conversation_send')
 
-  await assert.rejects(() => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: 'q' }, asB), /不能给自己发消息/)
+  await assert.rejects(() => send.execute({ sessionId: 'session-bbb', text: 'q' }, asB), /不能给自己发消息/)
 
-  await tools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '第一次' }, asB)
-  // **单向依赖必须放行**：B 问过 A，A 回话给 B —— 这是最常见的交接场景（新对话回问旧对话、旧对话回答）。
-  // 真机事故就是这里被误拦：A 开 B → B 回问 A → A 想回 B 被拒 → 两边全停。
-  const answerBack = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '你问我的那个是 X' }, asA)
-  assert.equal(answerBack.accepted, true, '单向依赖时，回话给对方必须放行（否则一个问答就把双方停摆）')
+  // 设计锚点：宿主自己的 send_message（主子 agent 通信）没有冷却/环路/深度。
+  // 两个对话之间的正常协作可以是任意多轮 —— 这里连跑 4 轮往返，必须全部畅通。
+  // （真机事故：A 开 B → B 回问 A → A 想回 B 被"环路"拒 → 两边全停。）
+  for (let round = 0; round < 4; round += 1) {
+    const asked = await send.execute({ sessionId: 'session-bbb', text: `第 ${round + 1} 轮 A 问 B` }, asA)
+    assert.equal(asked.accepted, true, `第 ${round + 1} 轮 A→B 必须畅通`)
+    const answered = await send.execute({ sessionId: 'session-aaa', text: `第 ${round + 1} 轮 B 答 A` }, asB)
+    assert.equal(answered.accepted, true, `第 ${round + 1} 轮 B→A 必须畅通（不能有环路/冷却拦正常问答）`)
+  }
 
-  // **双向依赖才是真环**：现在 A 也问过 B 了，再问就是"提问引发提问"的接力 → 拦
-  await assert.rejects(
-    () => tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '再问一次' }, asA),
-    (error) => /环路/.test(error.message) && /reply: true/.test(error.message),
-  )
-  // 同一场景传 reply: true 就必须放行（答复不受环路约束）
-  const cycled = await tools.get('conversation_send').execute({ sessionId: 'session-bbb', text: '这是我的答复', reply: true }, asA)
-  assert.equal(cycled.accepted, true, '答复必须能穿过环路护栏')
-
-  // 深度：maxDepth=0 时任何回问都超限
-  const shallow = createHarness()
-  apply(shallow.ctx, { ask: { maxDepth: 0 } })
-  const shallowTools = toolMap(shallow.tools)
-  await assert.rejects(
-    () => shallowTools.get('conversation_send').execute({ sessionId: 'session-aaa', text: 'q' }, asB),
-    /深度上限/,
-  )
-
-  // 冷却
-  const cooled = createHarness()
-  apply(cooled.ctx, { ask: { pairCooldownMs: 600000 } })
-  const cooledTools = toolMap(cooled.tools)
-  await cooledTools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '第一次' }, asB)
-  await assert.rejects(() => cooledTools.get('conversation_send').execute({ sessionId: 'session-aaa', text: '又来' }, asB), /刚问过/)
+  // 全局限频是唯一保留的防呆：它挡的是代码层面的死循环，不是模型发得勤
+  const limited = createHarness()
+  apply(limited.ctx, { ask: { globalPerMinute: 3 } })
+  const limitedSend = toolMap(limited.tools).get('conversation_send')
+  await limitedSend.execute({ sessionId: 'session-bbb', text: '1' }, asA)
+  await limitedSend.execute({ sessionId: 'session-bbb', text: '2' }, asA)
+  await limitedSend.execute({ sessionId: 'session-bbb', text: '3' }, asA)
+  await assert.rejects(() => limitedSend.execute({ sessionId: 'session-bbb', text: '4' }, asA), /一分钟内已投递/)
 }
 
 /* 9b. 双向管道：任意两个对话之间互塞消息（A→B 提问、B→A 回信，同一个工具） */
 {
   const harness = createHarness()
-  apply(harness.ctx, { ask: { pairCooldownMs: 600000 } })
+  apply(harness.ctx, {})
   const tools = toolMap(harness.tools)
   const asA = { agent: { session: { id: 'session-aaa', header: {} } } }
   const asB = { agent: { session: { id: 'session-bbb', header: {} } } }
   const send = tools.get('conversation_send')
 
-  // A 问过 B 之后，B 回信不得被"刚问过这个对话"的同对冷却拦住（回信是答复，不是新提问）
+  // 任意方向、任意多轮都不得被拦（这里已不再有冷却/环路）
   await send.execute({ sessionId: 'session-aaa', text: '把结论给我' }, asB)
-  const back = await send.execute({ sessionId: 'session-bbb', text: '结论 Z 已验证', reply: true }, asA)
+  const back = await send.execute({ sessionId: 'session-bbb', text: '结论 Z 已验证' }, asA)
   assert.equal(back.accepted, true)
   assert.equal(back.mode, 'steer', '回信默认也是插入式（插进对方下一步）')
   assert.equal(back.woken, true)
@@ -605,15 +592,16 @@ assert.deepEqual(inject, ['tools'])
   assert.match(sent.content[0].text, /结论 Z 已验证/)
   assert.match(sent.content[0].text, /sessionId=session-aaa/, '正文要写明是谁发的，对方才知道怎么回')
 
-  // reply=true：这是答复（不是新提问）—— 不包窄指令、落款仍然告诉对方要回时怎么回
-  const notice = await send.execute({ sessionId: 'session-bbb', text: '进度：还在跑', reply: true }, asA)
-  assert.equal(notice.narrow, false, '答复不包窄指令')
-  const noticeBody = harness.calls.prompt.at(-1).content[0].text
-  assert.doesNotMatch(noticeBody, /只回答下面这个问题/, '答复不得包窄指令')
-  assert.match(noticeBody, /conversation_send/, '落款要写明要回时怎么回')
+  // narrow 由**调用方自己**决定：默认包窄指令（让对方简洁作答），发答复/长内容时传 false
+  const plain = await send.execute({ sessionId: 'session-bbb', text: '进度：还在跑', narrow: false }, asA)
+  assert.equal(plain.narrow, false, 'narrow:false 时不包窄指令')
+  const plainBody = harness.calls.prompt.at(-1).content[0].text
+  assert.doesNotMatch(plainBody, /只回答下面这个问题/, 'narrow:false 时不得包窄指令')
+  assert.match(plainBody, /conversation_send/, '落款仍然要写明要回时怎么回')
+  assert.match(plainBody, /进度：还在跑/, '正文必须原样送达，插件不改写调用方写的内容')
 
   // wake:false → 只入队不唤醒，模式降级为 queue
-  const quiet = await send.execute({ sessionId: 'session-bbb', text: '进度：还在跑', reply: true, wake: false }, asA)
+  const quiet = await send.execute({ sessionId: 'session-bbb', text: '进度：还在跑', wake: false }, asA)
   assert.equal(quiet.woken, false)
   assert.equal(harness.calls.prompt.at(-1).mode, 'queue')
 
@@ -632,16 +620,16 @@ assert.deepEqual(inject, ['tools'])
   assert.doesNotMatch(subBody, /回它：用 `conversation_send`（sessionId=session-sub）/, '不能把子 agent 自己当回信地址')
 
   // B 觉得 A 问得不清楚 → 反问 A → A 答回去 → B 再给结论。
-  // 反问与新提问走的是同一个动作，区别只在 reply 标记；护栏不该拦这条链。
+  // 反问与新提问走的是同一个动作——同一个工具、同样的参数，没有任何"声明"。
   const harness3 = createHarness()
-  apply(harness3.ctx, { ask: { pairCooldownMs: 600000, maxDepth: 3 } })
+  apply(harness3.ctx, {})
   const tools3 = toolMap(harness3.tools)
   const execA = { agent: { session: { id: 'session-aaa', header: {} } } }
   const execB = { agent: { session: { id: 'session-bbb', header: {} } } }
   const q1 = await tools3.get('conversation_send').execute({ sessionId: 'session-bbb', text: '上个报错的根因是什么' }, execA)
-  const clarify = await tools3.get('conversation_send').execute({ sessionId: 'session-aaa', text: '你指的是哪个模块的报错？', reply: true }, execB)
+  const clarify = await tools3.get('conversation_send').execute({ sessionId: 'session-aaa', text: '你指的是哪个模块的报错？' }, execB)
   assert.equal(clarify.accepted, true, 'B 反问 A 必须能发出去（冷却/环路不得拦答复）')
-  const answer = await tools3.get('conversation_send').execute({ sessionId: 'session-bbb', text: '就是缓存游标那条', reply: true }, execA)
+  const answer = await tools3.get('conversation_send').execute({ sessionId: 'session-bbb', text: '就是缓存游标那条' }, execA)
   assert.equal(answer.accepted, true, 'A 答回去也必须能发出去')
   const conclusion = await tools3.get('conversation_send').execute({ sessionId: 'session-aaa', text: '根因是缓存游标没过期', reply: true }, execB)
   assert.equal(conclusion.accepted, true, 'B 最后给结论也必须能发出去')
@@ -651,21 +639,21 @@ assert.deepEqual(inject, ['tools'])
 
   // 两个普通对话（都不是对方的子会话）来回传话：这正是"任意 agent 之间"的管道
   const harness2 = createHarness()
-  apply(harness2.ctx, { ask: { pairCooldownMs: 0 } })
+  apply(harness2.ctx, {})
   const tools2 = toolMap(harness2.tools)
   const execX = { agent: { session: { id: 'session-X', header: {} } } }
   const execY = { agent: { session: { id: 'session-Y', header: {} } } }
   // 两边都是日志里没有的新会话：send 走 prompt 会现场建出它们
   const asked = await tools2.get('conversation_send').execute({ sessionId: 'session-Y', text: 'X 问 Y' }, execX)
   assert.equal(asked.accepted, true)
-  const replied = await tools2.get('conversation_send').execute({ sessionId: 'session-X', text: 'Y 回 X', reply: true }, execY)
+  const replied = await tools2.get('conversation_send').execute({ sessionId: 'session-X', text: 'Y 回 X' }, execY)
   assert.equal(replied.accepted, true)
 }
 
 /* 9c. 投递围栏：子 agent 会话 / 被活子 agent 持有的会话都不能投，且要说人话 */
 {
   const harness = createHarness()
-  apply(harness.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  apply(harness.ctx, {})
   const tools = toolMap(harness.tools)
   const asB = { agent: { session: { id: 'session-bbb', header: {} } } }
 
@@ -679,7 +667,7 @@ assert.deepEqual(inject, ['tools'])
 
   // 目标正被一个活着的子 agent 持有 → 宿主会拒，插件要把宿主的话翻译成可操作提示
   const held = createHarness({ heldTarget: 'session-aaa' })
-  apply(held.ctx, { ask: { maxDepth: 3, pairCooldownMs: 0 } })
+  apply(held.ctx, {})
   const heldSend = toolMap(held.tools).get('conversation_send')
   await assert.rejects(
     () => heldSend.execute({ sessionId: 'session-aaa', text: '在吗' }, asB),
@@ -799,14 +787,11 @@ assert.deepEqual(inject, ['tools'])
 
 /* 13. 配置合并 */
 {
-  assert.equal(resolveConfig({}).ask.maxDepth, 3)
-  assert.equal(resolveConfig({ ask: { maxDepth: 1 } }).ask.maxDepth, 1)
-  assert.equal(resolveConfig({ ask: { maxDepth: 1 } }).archive.maxHits, 20, '局部覆盖不得清掉兄弟字段')
+  assert.equal(resolveConfig({ ask: { globalPerMinute: 5 } }).archive.maxHits, 20, '局部覆盖不得清掉兄弟字段')
   assert.equal(resolveConfig({ ask: { defaultMode: 'queue' } }).ask.defaultMode, 'queue', '显式 queue 要保留（不打断对方当前回合）')
   assert.equal(resolveConfig({ ask: { defaultMode: 'nope' } }).ask.defaultMode, 'steer', '非法值回落默认：插入式')
   assert.equal(resolveConfig({}).ask.defaultMode, 'steer', '默认必须是插入式，且与 cordis.patch.yml 一致')
   assert.match(resolveConfig({}).ask.replyGuide, /\{\{fromSessionId\}\}/, '回信指引必须留发信人占位符')
-  assert.equal(resolveConfig({ ask: { maxDepth: 999 } }).ask.maxDepth, 20, '越界值收敛到上限')
   assert.match(resolveConfig({ ask: { narrowTemplate: 'Q: {{question}}' } }).ask.narrowTemplate, /\{\{question\}\}/)
 }
 
@@ -1034,4 +1019,4 @@ async function tempDir() {
 
 for (const dir of tmpDirs) await rm(dir, { recursive: true, force: true })
 
-console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信) + 压缩点/可信度四态(含工具调用帧与旧答复) + 护栏 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')
+console.log('smoke ok: 9 个工具 + 双向管道(steer 插话/回信/多轮畅通) + 压缩点/可信度四态(含工具调用帧与旧答复) + 防呆(自问/限频) + 中继落款 + 只读不唤醒 + 交接件硬契约 + 水位提醒 + 降级 + 配置合并 + 无损 JSON + 子 agent 地址 + atSeq 精确')

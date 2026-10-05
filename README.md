@@ -101,8 +101,6 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
   config:
     exposeTools: true
     ask:
-      maxDepth: 3              # 消息链最大跳数（超过就劝去翻旧书）
-      pairCooldownMs: 600000   # 同一对会话的最小间隔
       globalPerMinute: 30      # 全局限流
       defaultMode: steer       # steer = 插进对方下一步（默认）| queue = 等它本轮跑完
       narrow: true             # 包成窄指令（只回答、不复盘、不重做）
@@ -141,8 +139,9 @@ dsh plugin --profile <你的profile> add dsh-conversation-bridge
 - **压缩点可识别**：`compaction/summary` 带 `shadowedRange`，checkpoint 是带
   `surfaceOp:{op:'replace'}` 的 `user/message`；读到 checkpoint 会标成
   `[压缩摘要 seq=N，覆盖 seq=A..B；原文仍可翻]`，避免把摘要误当原始事实。
-- **护栏在插件内**：消息深度、环路、冷却、频率由插件自己维护的有向图推导，**不靠模型传参**；
-  护栏只拦"提问引发提问"的接力，答复/反问（`reply=true`）不受冷却与环路约束。
+- **只做防呆，不设门禁**：跨对话发消息是一条**纯管道**（对标宿主自己的 `send_message`）——
+    没有冷却、没有环路检测、没有深度上限。任意多轮协作都畅通；只留一个全局频率（每分钟 30 条）
+    挡代码死循环。防滥用交给调用方的判断与你在界面上的可视干预。
 
 完整设计与已核验的宿主机制（带证据）见 [`DESIGN.md`](./DESIGN.md)。
 
