@@ -282,7 +282,11 @@ v1 源码已修（`signalOf(exec)`），但**线上装的是旧代码**。
 - `ctx.on('session/event', (session, event) => ...)` —— 全局，post-commit，可拿到原始事件（压缩点判定可复用）；
 - `ctx.on('agent/created' | 'agent/disposed')`、`ctx.on('session/disposed')`；
 - `ctx.agents.get(sessionId)` —— 取**活** agent（判断"对方此刻是否在线"）；
-- 水位提醒的触发事件集（v1 已实测有效）：`assistant/message`、`assistant/attempt`、`request/context`、`tool/result`、`turn/end`。
+- 水位提醒只挂**轮次级**事件：`assistant/message`（每模型步骤一次）与 `turn/end`，
+  并带**每会话评估节流** `handoff.evalMinIntervalMs`（默认 1000ms）。
+  v1 曾同时挂 `assistant/attempt` / `request/context` / `tool/result`——那是每个工具调用、
+  每次请求都会来的高频事件，启动期（大量会话恢复 + 投影写入）叠加起来纯属白烧；
+  而水位判断本来就是轮次级的事，不需要逐个事件都算（2026-10-05 收敛）。
   注意 `request/context` **只在路由/窗口变化时**才写，不能当每轮信号。
 
 ### 3.9 工具与插件的工程约束（v1 实测）
@@ -885,6 +889,7 @@ handoff:
   rearmBelow: 0.55
   cooldownMs: 600000
   handoffQuietMs: 1800000
+  evalMinIntervalMs: 1000      # 同一会话两次压力评估的最小间隔（启动期降载）
   deliver: steer            # steer | queue
   skipSubagents: true
   toolEnabled: true         # 关掉 conversation_handoff_write（提醒改为"用你惯用的写文件工具"）

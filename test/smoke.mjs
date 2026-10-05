@@ -856,7 +856,7 @@ async function tempDir() {
 /* 15. 水位提醒：注入一次、不重复、回落后重新武装、交接后静默、子 agent 跳过 */
 {
   const harness = createHarness()
-  apply(harness.ctx, { handoff: { cooldownMs: 0, handoffQuietMs: 60000 } })
+  apply(harness.ctx, { handoff: { cooldownMs: 0, handoffQuietMs: 60000, evalMinIntervalMs: 0 } })
   const session = { id: 'session-live', header: { cwd: '<工作区>', origin: 'session' } }
   harness.liveAgents.set('session-live', { id: 'session-live', session })
   harness.setPressure({ contextWindow: 100000, pressureTokens: 80000, surfaceTokens: 0, sampledSurfaceTokens: 0 })

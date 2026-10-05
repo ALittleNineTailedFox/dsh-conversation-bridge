@@ -114,6 +114,7 @@ const DEFAULTS = Object.freeze({
     rearmBelow: 0.55,
     cooldownMs: 600000,
     handoffQuietMs: 1800000,
+    evalMinIntervalMs: 1000,
     deliver: 'steer',
     skipSubagents: true,
     toolEnabled: true,
@@ -199,6 +200,7 @@ export function resolveConfig(input) {
       threshold,
       rearmBelow,
       cooldownMs: readInteger(handoffRaw.cooldownMs, DEFAULTS.handoff.cooldownMs, 0, 24 * 3600 * 1000),
+      evalMinIntervalMs: readInteger(handoffRaw.evalMinIntervalMs, DEFAULTS.handoff.evalMinIntervalMs, 0, 60000),
       handoffQuietMs: readInteger(handoffRaw.handoffQuietMs, DEFAULTS.handoff.handoffQuietMs, 0, 7 * 24 * 3600 * 1000),
       deliver: handoffRaw.deliver === 'queue' ? 'queue' : 'steer',
       skipSubagents: readBoolean(handoffRaw.skipSubagents, DEFAULTS.handoff.skipSubagents),
@@ -1460,7 +1462,7 @@ export function apply(ctx, input = {}) {
     const key = String(sessionId)
     let state = handoffStates.get(key)
     if (state === undefined) {
-      state = { armed: true, lastRemindedAt: 0, handedOffAt: 0 }
+      state = { armed: true, lastRemindedAt: 0, handedOffAt: 0, lastEvaluatedAt: 0 }
       handoffStates.set(key, state)
     }
     return state
@@ -1503,23 +1505,31 @@ export function apply(ctx, input = {}) {
 
   /* ---- 水位提醒（独立于工具开关） ---- */
   if (config.handoff.enabled) {
-    // 每个模型步骤都会提交 assistant/message（有正文）或 assistant/attempt（只有工具调用）；
-    // request/context 只在路由/窗口变化时写；tool/result 会长大上下文表面。
-    const watched = new Set(['assistant/message', 'assistant/attempt', 'request/context', 'tool/result', 'turn/end'])
+    // 只挂**轮次级**事件：assistant/message（每个模型步骤一次）与 turn/end。
+    // 原先还挂了 assistant/attempt / request/context / tool/result——它们是每个工具调用、
+    // 每次请求都会来的高频事件，启动期（大量会话恢复、投影写入）叠加起来纯属白烧，
+    // 而水位判断本来就是轮次级的东西，不需要逐个事件都算。
+    const watched = new Set(['assistant/message', 'turn/end'])
+    /** 同一会话两次压力评估的最小间隔（可配置）：事件风暴时不再重复读投影。 */
+    const evalMinIntervalMs = config.handoff.evalMinIntervalMs
 
     const evaluate = (session) => {
       if (session === undefined || session === null) return
       if (config.handoff.skipSubagents && session.header?.origin === 'subagent') return
+      const now = Date.now()
+      const state = handoffStateFor(session.id)
+      // 节流放在最前面：连 agent 查询都省掉
+      if (now - state.lastEvaluatedAt < evalMinIntervalMs) return
+      state.lastEvaluatedAt = now
+
       const agent = ctx.get('agents')?.get?.(session.id)
       if (agent === undefined) return
       const pressure = host.readOwnPressure(agent.session)
       if (pressure === undefined) return
 
-      const state = handoffStateFor(session.id)
       if (pressure.ratio <= config.handoff.rearmBelow) state.armed = true
       if (pressure.ratio < config.handoff.threshold || !state.armed) return
 
-      const now = Date.now()
       if (now - state.lastRemindedAt < config.handoff.cooldownMs) return
       if (now - state.handedOffAt < config.handoff.handoffQuietMs) return
 

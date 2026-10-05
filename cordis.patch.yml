@@ -63,6 +63,8 @@
           cooldownMs: 600000
           # 交接过（或写过交接件）之后，本对话静默多久（毫秒）
           handoffQuietMs: 1800000
+          # 同一会话两次压力评估的最小间隔（毫秒）：启动期与事件风暴时降载
+          evalMinIntervalMs: 1000
           # steer = 落进下一步并唤醒（默认）；queue = 排到下一轮
           deliver: steer
           # 子 agent 会话不提醒

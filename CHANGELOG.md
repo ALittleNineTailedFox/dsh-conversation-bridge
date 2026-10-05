@@ -110,3 +110,7 @@
   于是多轮往返时插件自己发的反问/回信会把上一条提问的 `trust` 打成 `unknown`（自我污染）。
   现在发信侧用 `bridge-<uuid>` 作 `rpcId`，收信侧判「真人输入」时排除该前缀；
   前缀只落在 `source.rpcId` 上（消息 `id` 由宿主生成，不受影响）。边界：需通信双方都装本插件。
+- **水位提醒降载**：只挂 `assistant/message` 与 `turn/end` 两个轮次级事件，
+  并新增每会话评估节流 `handoff.evalMinIntervalMs`（默认 1000ms，可配置）。
+  原先还挂着 `assistant/attempt` / `request/context` / `tool/result`——每个工具调用、每次请求都会触发一次压力评估，
+  启动期（大量会话恢复 + 投影写入）叠加起来是纯白烧，而水位本来就只需要轮次级判断。
